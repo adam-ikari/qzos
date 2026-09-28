@@ -1,0 +1,14 @@
+# 交叉编译工具链与下载产物
+.tools/
+
+# 参考仓库本地克隆（按需 git clone https://github.com/Kasiin/C1-Slim-Ports）
+.refs/
+
+# 本机 agent 设置
+.qoder/
+
+# 构建输出
+build-*/
+
+# 临时
+*.log
