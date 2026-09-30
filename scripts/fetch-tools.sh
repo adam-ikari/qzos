@@ -39,5 +39,18 @@ if [ ! -x "$TOOLS/qemu-mipsel-static" ]; then
   fi
 fi
 
+# Cross-compiler wrappers baked with the C1 Slim target — the toolchain file
+# (cmake/toolchains/mipsel-zig.cmake) points at .tools/bin/zig-{cc,cxx}-mipsel.
+# Idempotent: regenerated every run so a wiped .tools/bin/ never breaks the
+# cross build. .tools/ is gitignored, so this MUST be scriptable.
+mkdir -p "$TOOLS/bin"
+for cc in cc cxx; do
+  cat > "$TOOLS/bin/zig-$cc-mipsel" <<EOF
+#!/usr/bin/env bash
+exec "$TOOLS/zig/zig" $cc -target mipsel-linux-musleabihf "\$@"
+EOF
+  chmod +x "$TOOLS/bin/zig-$cc-mipsel"
+done
+
 echo "==> tools ready:"
 "$TOOLS/zig/zig" version && "$TOOLS/ninja" --version
