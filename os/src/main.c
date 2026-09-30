@@ -4,8 +4,10 @@
  * Single thread, single uv loop (brain: qzos-ui-architecture):
  *   - LVGL tick via clock_gettime(CLOCK_MONOTONIC)
  *   - lv_timer_handler() runs from a uv timer at LV_DEF_REFR_PERIOD
- *   - qzjs ISOLATED host channel injected into the same loop (message_cb
- *     fires here -> bridge translates JSON UI ops into lv_* calls)
+ *   - qzjs ISOLATED outbox drained via per-rt mailbox + eventfd wake
+ *     (M-P7: qzjs owns its rt process/threads, never calls back into the
+ *     host; qz_recv_message here -> bridge translates JSON UI ops into
+ *     lv_* calls)
  *   - uvrpc services share the loop (loop injection, never uv_run itself)
  *   - evdev input via uv_poll
  *
@@ -24,6 +26,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <unistd.h>
 
 static uv_loop_t s_loop;
 static uv_timer_t s_lv_timer;
@@ -31,6 +34,8 @@ static uv_timer_t s_exit_timer;
 static qz_t *s_rt;
 static int s_running = 1;
 static bool s_have_exit_timer;
+static uv_poll_t s_msg_poll;
+static int s_msg_fd = -1;
 
 /* LVGL tick: monotonic ms */
 static uint32_t tick_cb(void)
@@ -60,15 +65,33 @@ static void autoexit_cb(uv_timer_t *t)
     uv_stop(&s_loop);
 }
 
-/* JS -> host: JSON UI ops */
-static void on_js_message(qz_t *rt, const char *json, size_t len, void *data)
+/* JS -> host: drain qzjs per-rt mailbox (M-P7: library posts into a FIFO and
+ * wakes an eventfd; it no longer calls back into the host). */
+static void drain_js_messages(void)
 {
-    (void)data;
-    if (getenv("QZ_LOOP_DEBUG")) {
-        fprintf(stderr, "[loop] msg alive=%d: %.*s\n",
-                uv_loop_alive(&s_loop), (int)(len > 120 ? 120 : len), json);
+    char *json = NULL;
+    size_t len = 0;
+    while (qz_recv_message(s_rt, &json, &len, 0) == 0) {
+        if (getenv("QZ_LOOP_DEBUG")) {
+            fprintf(stderr, "[loop] msg alive=%d: %.*s\n",
+                    uv_loop_alive(&s_loop), (int)(len > 120 ? 120 : len), json);
+        }
+        qzos_bridge_handle(json, len);
+        qz_free_message(json);
+        json = NULL;
     }
-    qzos_bridge_handle(json, len);
+}
+
+/* eventfd wakeup: recv-to-empty, then read fd to EAGAIN, then recv again
+ * (mailbox contract order — see qzjs.h qz_message_fd). */
+static void msg_fd_cb(uv_poll_t *p, int status, int events)
+{
+    (void)p; (void)events;
+    if (status < 0 || s_msg_fd < 0) return;
+    drain_js_messages();
+    uint64_t ctr;
+    while (read(s_msg_fd, &ctr, sizeof(ctr)) == (ssize_t)sizeof(ctr)) { }
+    drain_js_messages();
 }
 
 static void on_sigint(int sig)
@@ -154,8 +177,6 @@ int main(void)
 
     qz_config_t cfg;
     memset(&cfg, 0, sizeof(cfg));
-    cfg.uv_loop = &s_loop;
-    cfg.message_cb = on_js_message;
     cfg.initial_script = boot_script;
 
     s_rt = qz_create(&cfg);
@@ -165,12 +186,26 @@ int main(void)
     }
     qzos_bridge_set_rt(s_rt);
 
+    /* M-P7: qzjs owns its rt process/threads and posts outbox messages to a
+     * per-rt mailbox + eventfd; host no longer injects its loop or a
+     * message_cb. Poll the wake fd on our own loop. */
+    s_msg_fd = qz_message_fd(s_rt);
+    if (s_msg_fd >= 0) {
+        uv_poll_init(&s_loop, &s_msg_poll, s_msg_fd);
+        uv_poll_start(&s_msg_poll, UV_READABLE, msg_fd_cb);
+    }
+
     fprintf(stderr, "qzos-host: up (display=%s)\n", getenv("QZ_DISPLAY") ? getenv("QZ_DISPLAY") : "epaper");
 
     uv_run(&s_loop, UV_RUN_DEFAULT);
     fprintf(stderr, "[loop] run returned alive=%d\n", uv_loop_alive(&s_loop));
 
     /* teardown */
+    if (s_msg_fd >= 0) {
+        uv_poll_stop(&s_msg_poll);
+        uv_close((uv_handle_t *)&s_msg_poll, NULL);
+        s_msg_fd = -1;
+    }
     if (s_rt) qz_destroy(s_rt);
     uv_timer_stop(&s_lv_timer);
     uv_close((uv_handle_t *)&s_lv_timer, NULL);
