@@ -147,8 +147,17 @@ int main(void)
         return 1;
     }
 
-    lv_tick_set_cb(tick_cb);
+    /* 顺序要紧：lv_init() 会清掉已注册的 tick 回调（实测 lv_tick_get_cb()
+     * 由非 NULL 变 NULL），而本进程没有人调 lv_tick_inc()——时间基准只来自
+     * 这个回调。所以注册必须在 lv_init() **之后**。
+     *
+     * 之前写反了，后果是 lv_tick_get() 恒为 0：lv_timer_handler() 认为所有
+     * 定时器都没到期，于是 indev 读取定时器永不触发，键盘事件在 evdev 队列
+     * 里静静烂掉——屏上「按了没反应」。绘制当时看着是好的，因为 bridge 的
+     * refresh op 显式调了 lv_refr_now()，绕开了定时器；这正好把坏掉的定时器
+     * 子系统盖住了。 */
     lv_init();
+    lv_tick_set_cb(tick_cb);
     if (qzos_display_init() != 0) {
         fprintf(stderr, "qzos-host: display init failed\n");
         return 1;

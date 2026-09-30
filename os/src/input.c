@@ -43,6 +43,9 @@ static unsigned s_evq_head, s_evq_tail;
 static lv_indev_t *s_keypad;
 static lv_group_t *s_group;
 static uint32_t s_last_key; /* retained across release reads */
+static bool s_trace;         /* QZ_INPUT_DEBUG: 每一次进/出队都打 —— 输入是
+                              * 唯一没有自动化覆盖的通路，链路上任何一环
+                              * 静默丢键都表现为"屏上没反应"，无法定位 */
 
 static bool push_event(uint16_t code, uint8_t state)
 {
@@ -126,6 +129,7 @@ static uint32_t to_lv_key(uint16_t code)
 
 static void keypad_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 {
+    (void)indev;
     evq_item_t ev;
     while (pop_event(&ev)) {
         if (is_system_key(ev.code)) {
@@ -138,6 +142,7 @@ static void keypad_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
         if (ev.state == 0) { /* release of last key */
             data->key = s_last_key;
             data->state = LV_INDEV_STATE_RELEASED;
+            if (s_trace) fprintf(stderr, "[in] -> LVGL release key=0x%02x\n", data->key);
             return;
         }
         uint32_t k = to_lv_key(ev.code);
@@ -145,6 +150,9 @@ static void keypad_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
         s_last_key = k;
         data->key = k;
         data->state = LV_INDEV_STATE_PRESSED;
+        if (s_trace)
+            fprintf(stderr, "[in] -> LVGL press key=0x%02x focus=%p\n",
+                    k, (void *)lv_group_get_focused(s_group));
         return;
     }
     /* nothing new: hold current key state as released */
@@ -182,7 +190,10 @@ static void poll_cb(uv_poll_t *handle, int status, int events)
                     code != KEY_PAGEUP && code != KEY_PAGEDOWN) continue;
                 st = 1;
             }
-            push_event(code, st);
+            if (!push_event(code, st) && s_trace)
+                fprintf(stderr, "[in] evq OVERFLOW dropped code=%u\n", code);
+            else if (s_trace)
+                fprintf(stderr, "[in] ev code=%u state=%u\n", code, st);
         }
     }
 }
@@ -210,6 +221,8 @@ lv_group_t *qzos_input_group(void)
 
 int qzos_input_init(uv_loop_t *loop)
 {
+    s_trace = getenv("QZ_INPUT_DEBUG") != NULL;
+
     s_group = lv_group_create();
     lv_group_set_default(s_group);
 
@@ -222,5 +235,12 @@ int qzos_input_init(uv_loop_t *loop)
     const char *p1 = getenv("QZ_INPUT1");
     open_evdev(p0 ? p0 : "/dev/input/event0", loop, &s_ev[0]);
     open_evdev(p1 ? p1 : "/dev/input/event1", loop, &s_ev[1]);
+    if (s_trace)
+        fprintf(stderr, "[in] group=%p indev=%p dev0=%s dev1=%s "
+                        "disp=%p next_timer=%ums\n",
+                (void *)s_group, (void *)s_keypad,
+                p0 ? p0 : "/dev/input/event0", p1 ? p1 : "(default)",
+                (void *)(s_keypad ? lv_indev_get_display(s_keypad) : NULL),
+                lv_timer_get_time_to_next());
     return 0;
 }

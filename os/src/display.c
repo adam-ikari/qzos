@@ -224,13 +224,21 @@ void qzos_display_commit(void)
     qzos_dirty_clamp(&s_dirty, s_panel->hor_res, s_panel->ver_res, s_panel->strip_h);
 
     /* 帧级差分：LVGL 报脏不等于像素真的变了（重绘可能产出相同内容）。
-     * e-ink 上「无变化就完全不刷」是硬要求。 */
+     * e-ink 上「无变化就完全不刷」是硬要求——所以 changed==0 必须一路传到
+     * 策略层（策略的契约就是 dirty_pixels==0 -> ACT_NONE），而不是自己
+     * 在这里偷偷刷一次。否则每次「重绘了但内容一样」（焦点态切换、样式
+     * 重算、LVGL 内部 invalidate）都会白刷一次墨水屏。 */
     int32_t changed = qzos_raster_diff_bytes(s_frame, s_written, sizeof(s_frame));
 
     /* 脏区取「LVGL 报告的」与「实际变化的」中较窄的一个：
      * 前者可能包含未变像素，后者一定是真的变了。 */
-    qzos_dirty_t real;
-    if (changed > 0) {
+    if (changed == 0) {
+        /* 屏上内容与上次提交完全一致：没有可刷的东西。全刷请求要照常
+         * 生效（清残影是面板的事，与内容是否变化无关），所以这里只清
+         * 脏区，把决策权留给策略的 pending_full 分支。 */
+        qzos_dirty_reset(&s_dirty);
+    } else {
+        qzos_dirty_t real;
         qzos_raster_diff_dirty(s_frame, s_written,
                                s_panel->hor_res, s_panel->ver_res,
                                s_panel->strip_h, &real);
@@ -247,7 +255,9 @@ void qzos_display_commit(void)
     if (be->dump_raw) raw_dump();
 
     if (act == QZOS_ACT_NONE) {
-        /* 没落到屏上：脏区保留，等下一帧合并（避免高频小改动导致频繁刷屏） */
+        /* 没落到屏上：脏区保留，等下一帧合并（避免高频小改动导致频繁刷屏）。
+         * changed==0 的情形脏区已经在上面清空了——没有待提交的像素，
+         * 留着它只会让后续提交一直以为"有东西要刷"。 */
         if (changed == 0) qzos_dirty_reset(&s_dirty);
         return;
     }
