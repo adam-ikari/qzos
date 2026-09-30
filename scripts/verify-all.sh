@@ -27,6 +27,9 @@ bash scripts/test-apkg.sh
 step "shell app model end-to-end (manifest gate, pixel assertions)"
 bash os/test/test_shell_apps.sh
 
+step "JS engine crash recovery (kill rt, expect notice + respawn)"
+bash os/test/verify-rt-recovery.sh
+
 step "keyboard end-to-end (FIFO replay, semantic assertions)"
 bash scripts/verify-input.sh
 

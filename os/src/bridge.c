@@ -487,7 +487,23 @@ void qzos_bridge_handle(const char *json, size_t len)
     }
     const char *op = cJSON_GetStringValue(cJSON_GetObjectItem(j, "op"));
     if (!op) {
-        /* 非 op 消息（如 {evt:'error'}）：打到 stderr 便于诊断 */
+        /* qzjs 的引擎级错误帧：{"type":"error","error":"...-exited-unexpectedly"}。
+         *
+         * 这一帧曾经只被 fprintf 到 stderr 就丢掉——而它恰恰是「JS 引擎整个
+         * 死了」的唯一信号。丢掉的后果实测得到：宿主继续健康地跑、面板上仍是
+         * 完好无损的桌面画面、按键仍被读取，用户却按什么都没反应，只能重启
+         * 设备。一个不报信的桌面比崩溃更糟，因为它骗人。
+         *
+         * 所以这里转成 rtError 投给 JS，并请宿主安排重建（见 main.c）。 */
+        const char *type = cJSON_GetStringValue(cJSON_GetObjectItem(j, "type"));
+        if (type && strcmp(type, "error") == 0) {
+            const char *err = cJSON_GetStringValue(cJSON_GetObjectItem(j, "error"));
+            fprintf(stderr, "[js] engine error: %s\n", err ? err : "(none)");
+            qzos_host_on_rt_death(err);
+            cJSON_Delete(j);
+            return;
+        }
+        /* 其余非 op 消息：打到 stderr 便于诊断 */
         char *raw = cJSON_PrintUnformatted(j);
         if (raw) {
             fprintf(stderr, "[js] %s\n", raw);

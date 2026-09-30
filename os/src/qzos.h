@@ -23,6 +23,9 @@ int qzos_input_init(struct uv_loop_s *loop);
 struct _lv_group_t *qzos_input_group(void);
 /* Internal: bridge uses this to push system-key JSON to JS. */
 void qzos_bridge_send_key(const char *key);
+/* 引擎死/活时切输入。停输入的理由：JS 引擎死后没有任何东西能消费按键，
+ * 而画面还停在旧桌面上——用户会一直按下去。宁可不响应，不要骗人。 */
+void qzos_input_enable(int on);
 
 /* ---- services: uvrpc system-services plane (services.c) ---- */
 typedef void (*qzos_rpc_done_t)(int ok, const char *result, size_t len, void *u);
@@ -38,5 +41,14 @@ void qzos_bridge_set_rt(struct qz_t *rt);
 void qzos_bridge_handle(const char *json, size_t len);
 /* Send a JSON message to JS (safe from the loop thread). */
 void qzos_bridge_sendf(const char *fmt, ...);
+
+/* ---- 引擎崩溃恢复（main.c 编排）----
+ * bridge.c 识别到 qzjs 的 {"type":"error",...} 帧时调 qzos_host_on_rt_death，
+ * 由宿主停输入 + 排一次带退避的 rt 重建。 */
+void qzos_host_on_rt_death(const char *reason);
+/* 重启期间显示/撤下提示。画在屏幕上是因为「什么都不显示」正是要修的病症：
+ * 用户需要一个明确的「系统正在重启」，而不是一块看着正常的死画面。 */
+void qzos_show_rt_dead(uint32_t retry_ms);
+void qzos_hide_rt_dead(void);
 
 #endif /* QZOS_H */

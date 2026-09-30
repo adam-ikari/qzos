@@ -80,6 +80,26 @@ panel        设备 I/O         唯一知道硬件细节的一层
 | `QZ_AUTO_COMMIT` | `1` | `0` = 只在显式 `refresh` op 时提交 |
 | `QZ_DISPLAY_DEBUG` | — | 每次提交多打脏区矩形 + 变化 ASCII 图（`#` 本次变黑 / `o` 变白 / `.` 没变）。查「无缘无故多刷屏」用：只看 `changed` 字节数猜不出来源，看得见形状才知道是哪个控件在动 |
 
+## JS 引擎崩溃恢复
+
+`qzjs-rt`（跑 JS 的独立进程）挂掉时，qzjs 会往邮箱推一帧
+`{"type":"error","error":"main-runtime-process-exited-unexpectedly"}`。
+`bridge.c` 认这帧 → `qzos_host_on_rt_death()` 排一次带退避的 rt 重建：
+
+1. **告知** —— 屏上画 `JS engine stopped` + 倒计时（正中 292×80 框，全刷）
+2. **停输入** —— `qzos_input_enable(0)` 停 poll 并清空事件队列。引擎死后按键
+   无人消费而画面停在旧桌面上，继续响应只会骗人
+3. **重建** —— `qz_destroy` + `qz_create` + 重挂 `qz_message_fd` + 重跑 boot。
+   M-P7 契约下宿主不持有 rt 内部状态，销毁即干净
+4. **恢复** —— 开输入、撤提示、**退避复位**
+
+退避 1s→2s→4s…封顶 30s。用退避而非固定间隔，是因为最危险的场景正是「一起
+就崩」——固定 1s 会变成无限重启循环，把墨水屏刷满、电池耗光，而这些刷新一点
+用都没有。
+
+**开机时 rt 起不来也不退出**：设备是墨水屏一体机，宿主一退就是黑屏，用户只能
+等电池耗尽或物理断电。留在退避循环里，qzjs-rt 一旦就位就自动起来。
+
 ## 授权面（app package）
 
 `os/js/apkg.js` 做 manifest 校验与信任判定，`os/js/sandbox.js` 在**加载任何应用
@@ -151,6 +171,7 @@ bash scripts/verify-all.sh
 | `scripts/test-keymap.sh` | evdev 键码映射（82 断言，键码常量取自 `<linux/input.h>`） | 否 / 否 |
 | `scripts/test-apkg.sh` | 应用包校验 + 授权遮蔽（82 断言）。**跑在真实 qzjs 上**：核心断言是「`__native__` 那 57 个原生真被遮住了」，在 node 上跑等于什么都没测 | 原生 qzjs / 否 |
 | `os/test/test_shell_apps.sh` | 应用模型端到端：坏 manifest 被列出来但拒绝启动，**判据是画面像素** | 是 / 否 |
+| `os/test/verify-rt-recovery.sh` | JS 引擎崩溃恢复：杀 `qzjs-rt`，断言屏上出现提示、rt 被重建、桌面逐字节复现、开机失败也留在退避循环 | 是 / 否 |
 | `scripts/verify-input.sh` | 键盘端到端（`QZ_INPUT0` 接 FIFO 回放）+ e-ink 刷新预算 | 是 / 否 |
 | `scripts/verify-frames.sh` | 原生 vs MIPS 帧逐字节一致（MIPS 经 qemu-user） | 是 / 否 |
 | `tools/rpc-ipc-selftest.sh` | uvrpc 外部 IPC 客户端调 `sys.info` | 是 / 否 |

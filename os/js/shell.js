@@ -293,9 +293,12 @@
   ui.refresh(true); /* 首帧全刷 */
   console.log('[shell] up, ' + apps.length + ' apps');
 
-  /* 事件驱动为主，但主 RT 在「无事可做」时会 idle 自退（qzjs-rt
-   * --qzjs-rt-server 形态），宿主随即收到 exited-unexpectedly。
-   * 桌面壳在等用户按键，属于「有活」，用低频心跳把 loop 钉住。
-   * 注意这不是动画：UI 不变，不产生任何重绘/提交。 */
-  setInterval(function () { /* keep the shell alive, no redraw */ }, 5000);
+  /* 曾经这里有个 setInterval(…, 5000) 心跳，注释说「主 RT 会 idle 自退，
+   * 心跳把它钉住」。实测 25 秒无按键：主 RT **没有**自退（qzjs_rt_host.c 的
+   * 崩溃检测只在「已 ready 且非预期退出」时才推错误帧，idle 自退有独立的
+   * idle_ack 通道，而 ISOLATED 的主RT 是常驻进程）。所以那个心跳的前提
+   * 不成立，留着只是白耗电。
+   *
+   * 真要钉住 loop，正确的位置是宿主侧（有活干的判据在 C 侧），不是 JS 侧
+   * 烧一个定时器。JS 侧保持纯事件驱动——这也符合 e-ink「无事不刷」。 */
 })();

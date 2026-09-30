@@ -94,6 +94,131 @@ static void msg_fd_cb(uv_poll_t *p, int status, int events)
     drain_js_messages();
 }
 
+/* ---- JS 引擎崩溃恢复 ----
+ *
+ * qzjs-rt 是跑 JS 的**独立进程**。它挂掉时库会把一帧
+ * {"type":"error","error":"main-runtime-process-exited-unexpectedly"}
+ * 推进邮箱，但仅此而已：宿主自己完全健康——LVGL 继续 tick、面板上仍是完好
+ * 的桌面画面、按键仍被读取。没有这层处理，用户面对的是一个「按任何键都没
+ * 反应」的僵尸桌面，只能重启设备。对一台「要作为系统」的设备这是致命的，
+ * 因为桌面必须同时是**可靠性的门面**。
+ *
+ * 这里做三件事，缺一不可：
+ *   1. 认帧 + 告知（bridge.c 的 qzos_bridge_handle 负责转成 evt:rtError）
+ *   2. 停掉输入：引擎死后按键毫无意义，继续响应只会骗人
+ *   3. 重建 rt 并重跑 boot，带退避（rt 反复崩溃时别疯狂重启耗电）
+ */
+
+/* 崩溃后的重启退避：1s, 2s, 4s…封顶 30s。
+ * 不用固定间隔是因为最危险的场景正是「一启动就崩」——固定 1s 会变成
+ * 无限重启循环，把墨水屏刷满、把电池耗光，而这些刷新一点用都没有。 */
+static uint32_t s_restart_delay_ms = 1000;
+static const uint32_t s_restart_delay_max_ms = 30000;
+
+static int s_restart_armed;
+static uv_timer_t s_restart_timer;
+static uv_timer_t s_input_timer;   /* 死引擎期间用来消抖，不做别的事 */
+static bool s_have_input_timer;
+static char s_boot_script[1024];
+static int s_restart_count;
+
+static void restart_cb(uv_timer_t *t);
+
+/* rt 死亡 → 通知 JS + 停输入 + 排一次重建。
+ * 由 bridge.c 在识别到 rtError 帧时调用（见 qzos_bridge_notify_rt_death）。 */
+void qzos_host_on_rt_death(const char *reason)
+{
+    fprintf(stderr, "qzos-host: JS engine died (%s); restart in %ums\n",
+            reason ? reason : "unknown", s_restart_delay_ms);
+
+    /* 提示与停输入都要做，且必须在「已排过重启」这个早退**之前**——
+     * 第二次崩溃时若提前 return，提示就不会更新倒计时，用户看到的是
+     * 上一次的旧秒数，而实际退避已经翻倍了。 */
+    qzos_show_rt_dead(s_restart_delay_ms);
+    qzos_input_enable(0);
+
+    if (s_restart_armed) return;   /* 已排过一次，别叠 */
+    s_restart_armed = 1;
+    uv_timer_init(&s_loop, &s_restart_timer);
+    uv_timer_start(&s_restart_timer, restart_cb, s_restart_delay_ms, 0);
+}
+
+/* 真正重建：qz_destroy + qz_create + 重挂 poll，然后重跑 boot。
+ * M-P7 契约下宿主不持有 rt 内部状态（库不回调宿主、没有 message_cb），
+ * 所以销毁就是干净的，重建也不需要额外清理。 */
+static int spawn_rt(void)
+{
+    qz_config_t cfg;
+    memset(&cfg, 0, sizeof(cfg));
+    cfg.initial_script = s_boot_script;
+
+    s_rt = qz_create(&cfg);
+    if (!s_rt) {
+        fprintf(stderr, "qzos-host: qz_create failed (qzjs-rt next to binary?)\n");
+        return -1;
+    }
+    qzos_bridge_set_rt(s_rt);
+
+    /* 重挂 wake fd。旧 poll 已 close（uv_close 是异步的，所以这里 uv_run
+     * 排空过才重新 init，见 restart_cb 的 uv_run(&s_loop, UV_RUN_NOWAIT)）。 */
+    s_msg_fd = qz_message_fd(s_rt);
+    if (s_msg_fd >= 0) {
+        uv_poll_init(&s_loop, &s_msg_poll, s_msg_fd);
+        uv_poll_start(&s_msg_poll, UV_READABLE, msg_fd_cb);
+    }
+    fprintf(stderr, "qzos-host: JS engine up (restart #%d)\n", s_restart_count);
+    return 0;
+}
+
+/* 退避翻倍并重排。开机失败与运行中失败共用——两者的区别只是「有没有上一代
+ * rt 要收」，策略不该有别。 */
+static void arm_restart_again(void)
+{
+    s_restart_delay_ms =
+        s_restart_delay_ms * 2 > s_restart_delay_max_ms
+            ? s_restart_delay_max_ms : s_restart_delay_ms * 2;
+    fprintf(stderr, "qzos-host: respawn failed, next attempt in %ums\n",
+            s_restart_delay_ms);
+    s_restart_armed = 1;
+    uv_timer_init(&s_loop, &s_restart_timer);
+    uv_timer_start(&s_restart_timer, restart_cb, s_restart_delay_ms, 0);
+}
+
+static void restart_cb(uv_timer_t *t)
+{
+    (void)t;
+    s_restart_armed = 0;
+    uv_timer_stop(&s_restart_timer);
+    uv_close((uv_handle_t *)&s_restart_timer, NULL);
+
+    /* 收掉上一代的 poll 与 rt。qz_destroy 内部会等主RT 收尸（最坏 ≤2s），
+     * 期间会阻塞在本回调里——这没问题：此刻屏幕上只有一条重启提示，
+     * 没有交互在进行。 */
+    if (s_msg_fd >= 0) {
+        uv_poll_stop(&s_msg_poll);
+        uv_close((uv_handle_t *)&s_msg_poll, NULL);
+        s_msg_fd = -1;
+    }
+    if (s_rt) { qz_destroy(s_rt); s_rt = NULL; }
+    /* uv_close 是异步的：必须让 loop 跑一轮把 close 回调真正处理掉，
+     * 否则下面重新 uv_poll_init 到同一个 fd 位置会撞上仍在关闭的 handle。 */
+    uv_run(&s_loop, UV_RUN_NOWAIT);
+
+    s_restart_count++;
+    if (spawn_rt() != 0) {
+        /* 连引擎都起不来（qzjs-rt 不在？）：退避翻倍后再试。
+         * 不放弃——放弃就等于「僵尸宿主」，而那正是要修的东西。 */
+        arm_restart_again();
+        return;
+    }
+
+    /* 引擎活着了：恢复交互，清掉提示。退避复位。 */
+    s_restart_delay_ms = 1000;
+    qzos_input_enable(1);
+    qzos_hide_rt_dead();
+    fprintf(stderr, "qzos-host: input re-enabled\n");
+}
+
 static void on_sigint(int sig)
 {
     (void)sig;
@@ -184,24 +309,32 @@ int main(void)
         }
     }
 
-    qz_config_t cfg;
-    memset(&cfg, 0, sizeof(cfg));
-    cfg.initial_script = boot_script;
+    /* boot 脚本要跨 rt 重建复用（重启时重跑的就是它），所以存成文件作用域 */
+    snprintf(s_boot_script, sizeof(s_boot_script),
+             "%s\n"
+             "globalThis.__QZ_JS_DIR = '%s';\n"
+             "globalThis.__QZ_APP_DIR = '%s';\n"
+             "(async function () {\n"
+             "  try {\n"
+             "    var src = await qzjs.fs.readFile('%s/shell.js');\n"
+             "    (0, eval)(src);\n"
+             "    postMessage({evt: 'ready'});\n"
+             "  } catch (err) {\n"
+             "    postMessage({evt: 'error', msg: String(err)});\n"
+             "  }\n"
+             "})();\n",
+             BOOT_DISPATCHER, js_dir, app_dir, js_dir);
+    snprintf(boot_script, sizeof(boot_script), "%s", s_boot_script);
 
-    s_rt = qz_create(&cfg);
-    if (!s_rt) {
-        fprintf(stderr, "qzos-host: qz_create failed (qzjs-rt next to binary?)\n");
-        return 1;
-    }
-    qzos_bridge_set_rt(s_rt);
-
-    /* M-P7: qzjs owns its rt process/threads and posts outbox messages to a
-     * per-rt mailbox + eventfd; host no longer injects its loop or a
-     * message_cb. Poll the wake fd on our own loop. */
-    s_msg_fd = qz_message_fd(s_rt);
-    if (s_msg_fd >= 0) {
-        uv_poll_init(&s_loop, &s_msg_poll, s_msg_fd);
-        uv_poll_start(&s_msg_poll, UV_READABLE, msg_fd_cb);
+    /* 开机时 rt 起不来**不能退出**：设备是墨水屏一体机，宿主一退就是黑屏，
+     * 用户只能等电池耗尽或物理断电。留在退避循环里，qzjs-rt 一旦就位
+     * （比如 /storage 还没挂载完、文件被占）就自动起来。
+     * 代价是「看起来没反应」——所以提示必须同时画出来。 */
+    if (spawn_rt() != 0) {
+        fprintf(stderr, "qzos-host: initial spawn failed; staying in retry loop\n");
+        qzos_show_rt_dead(s_restart_delay_ms);
+        qzos_input_enable(0);
+        arm_restart_again();
     }
 
     fprintf(stderr, "qzos-host: up (display=%s)\n", getenv("QZ_DISPLAY") ? getenv("QZ_DISPLAY") : "epaper");

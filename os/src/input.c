@@ -165,14 +165,46 @@ static void keypad_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
 typedef struct {
     uv_poll_t poll;
     int fd;
+    bool inited;   /* uv_poll_init 是否真的跑过——静态零初始化的 fd 是 0 而
+                    * 不是 -1，光判 fd<0 会把「没初始化」当成「stdin」，于是
+                    * 对一个从未 uv_poll_init 的 handle 调 uv_poll_stop 直接
+                    * 段错误（实测：引擎崩溃恢复路径必崩）。 */
 } evdev_t;
 
 static evdev_t s_ev[2];
+
+static void poll_cb(uv_poll_t *handle, int status, int events);
+
+/* 输入总闸。JS 引擎死后关掉：按键会被读走但没有任何东西能消费，而画面还
+ * 停在旧桌面上——用户会一直按。停 poll 而不是让 poll_cb 丢弃：后者仍在
+ * 消耗事件，看起来「系统在动」，更骗人。 */
+static int s_input_enabled = 1;
+
+void qzos_input_enable(int on)
+{
+    if (on == s_input_enabled) return;
+    s_input_enabled = on;
+    for (int i = 0; i < 2; i++) {
+        if (!s_ev[i].inited) continue;
+        if (on) uv_poll_start(&s_ev[i].poll, UV_READABLE, poll_cb);
+        else     uv_poll_stop(&s_ev[i].poll);
+    }
+    /* 顺便把排队的残留事件清掉：恢复后第一下不能让用户「补上」引擎死前
+     * 按的那些键——那些键的语义早就过期了（按的可能是「返回」）。 */
+    struct input_event ie[16];
+    for (int i = 0; i < 2; i++) {
+        if (!s_ev[i].inited) continue;
+        while (read(s_ev[i].fd, ie, sizeof(ie)) > 0) { }
+    }
+    s_evq_head = s_evq_tail = 0;
+    fprintf(stderr, "qzos-input: %s\n", on ? "enabled" : "disabled (engine down)");
+}
 
 static void poll_cb(uv_poll_t *handle, int status, int events)
 {
     (void)events;
     if (status < 0) return;
+    if (!s_input_enabled) return;
     evdev_t *dev = (evdev_t *)handle;
     struct input_event ie[16];
     for (;;) {
@@ -206,6 +238,7 @@ static int open_evdev(const char *path, uv_loop_t *loop, evdev_t *slot)
         return 0; /* not fatal: e.g. no event1 on some units / qemu */
     }
     slot->fd = fd;
+    slot->inited = true;
     uv_poll_init(loop, &slot->poll, fd);
     slot->poll.data = slot;
     uv_poll_start(&slot->poll, UV_READABLE, poll_cb);

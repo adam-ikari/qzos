@@ -357,3 +357,72 @@ void qzos_display_commit(void)
                 qzos_action_name(act), rc);
     }
 }
+
+/* ---- 引擎崩溃提示 ----
+ *
+ * 用 LVGL label 而不是直接往 1bpp 帧里画字：字形来自 Fusion Pixel 位图字体，
+ * 走 LVGL 才不用在这里重造一套点阵渲染；而这也顺带保证了「提示自己也要过
+ * 显示层」（脏区/波形/提交），不会出现「提示画了但没落屏」。
+ *
+ * 1bpp 只有黑白两色，所以提示不能靠颜色表达严重程度——它靠**说清下一步**
+ * 来表达：还有多久重试。1bpp 屏上动画一律禁止，这里也就没有闪烁。
+ */
+
+static lv_obj_t *s_rt_dead_box;
+
+static const char *fmt_retry(char *buf, size_t n, uint32_t retry_ms)
+{
+    snprintf(buf, n, "Retrying in %u.%us", retry_ms / 1000u,
+             (retry_ms % 1000u) / 100u);
+    return buf;
+}
+
+void qzos_show_rt_dead(uint32_t retry_ms)
+{
+    if (s_rt_dead_box) {
+        /* 已在提示中：只更新倒计时文本，不重建（重建会多一次提交 = 多刷屏） */
+        lv_obj_t *t = lv_obj_get_child(s_rt_dead_box, 1);
+        if (t) {
+            char buf[48];
+            lv_label_set_text(t, fmt_retry(buf, sizeof(buf), retry_ms));
+        }
+        qzos_display_repaint();
+        return;
+    }
+
+    s_rt_dead_box = lv_obj_create(lv_screen_active());
+    lv_obj_remove_style_all(s_rt_dead_box);
+    lv_obj_set_style_bg_color(s_rt_dead_box, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(s_rt_dead_box, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_rt_dead_box, 1, 0);
+    lv_obj_set_style_border_color(s_rt_dead_box, lv_color_black(), 0);
+    lv_obj_set_style_radius(s_rt_dead_box, 0, 0);
+    lv_obj_set_size(s_rt_dead_box, 292, 80);
+    lv_obj_align(s_rt_dead_box, LV_ALIGN_CENTER, 0, 0);
+
+    lv_obj_t *t1 = lv_label_create(s_rt_dead_box);
+    lv_obj_remove_style_all(t1);
+    lv_obj_set_style_text_color(t1, lv_color_black(), 0);
+    lv_label_set_text(t1, "JS engine stopped");
+    lv_obj_align(t1, LV_ALIGN_TOP_MID, 0, 10);
+
+    char buf[48];
+    lv_obj_t *t2 = lv_label_create(s_rt_dead_box);
+    lv_obj_remove_style_all(t2);
+    lv_obj_set_style_text_color(t2, lv_color_black(), 0);
+    lv_label_set_text(t2, fmt_retry(buf, sizeof(buf), retry_ms));
+    lv_obj_align(t2, LV_ALIGN_BOTTOM_MID, 0, -10);
+
+    fprintf(stderr, "qzos-display: engine-dead notice shown (%ums)\n", retry_ms);
+    qzos_display_repaint();
+    qzos_display_full_refresh();   /* 波形切换处，显式全刷保证残影清掉 */
+}
+
+void qzos_hide_rt_dead(void)
+{
+    if (!s_rt_dead_box) return;
+    lv_obj_delete(s_rt_dead_box);
+    s_rt_dead_box = NULL;
+    fprintf(stderr, "qzos-display: engine-dead notice cleared\n");
+    qzos_display_repaint();
+}

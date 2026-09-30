@@ -30,6 +30,12 @@ void qzos_display_repaint(void);
  * commit 前有效——用于导出、差分校验、外部服务读回。 */
 const uint8_t *qzos_display_frame(uint32_t *len);
 
+/* 引擎崩溃期间的整屏提示（"系统正在重启"）。**必须画出来**：「什么都不显示」
+ * 正是要修的病症——用户需要一个明确的告知，而不是一块看着正常的死画面。
+ * 撤销走 qzos_hide_rt_dead（清屏，重建后由 shell 重画桌面）。 */
+void qzos_show_rt_dead(uint32_t retry_ms);
+void qzos_hide_rt_dead(void);
+
 /* 当前累计脏区（自上次落屏以来）。无脏区返回 false。 */
 bool qzos_display_dirty_region(int32_t *x, int32_t *y, int32_t *w, int32_t *h);
 
