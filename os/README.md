@@ -45,6 +45,20 @@ panel        设备 I/O         唯一知道硬件细节的一层
 
 **局部刷新的实际含义**：MP-D261 驱动只接受整帧 `write(5624)`，没有区域参数。所以局部刷新 = **提交决策**，不是少写字节：无变化完全不刷（省 e-ink 寿命），脏区小时切快速波形。实测改一个字符 → 脏区 10.5%（一条带 + 条带对齐）、9 字节变化。字节级区域写入需要换支持区域参数的控制器，那时在 `panel.c` 加一个 variant 即可，上层不动。
 
+## 键盘
+
+这台设备**没有触摸**，键盘是唯一输入通路，所以键盘契约是硬约束（详见 `os/src/keymap.c` 与 brain `qzos-ui-architecture`）：
+
+- **evdev 字母码不连续**（`KEY_Q=16`、`KEY_A=30`、`KEY_Z=44`，中间跳过修饰键）。
+  绝不能用 `'a' + (code - KEY_A)` 这类算术推字符——那会让几乎每个字母静默打错
+  （`KEY_H`→`'f'`、`KEY_0`→`':'`），屏幕上只表现为"键盘不好使"。映射逐项写死。
+- **方向键 → 焦点移动由宿主自己做**（`input.c` 的 `adapt_arrows`）。LVGL v9 的
+  keypad 只把 `LV_KEY_NEXT`/`LV_KEY_PREV` 当作"移动 group 焦点"，方向键要走
+  gridnav，而本项目 `LV_USE_GRIDNAV=0`；设备键盘又没有 Tab / PageUp / PageDown，
+  所以直接把方向键交给 LVGL 的后果是桌面应用列表**在真机上根本走不动**。
+- **编辑态归 focus 决定**：bridge 的 `op:focus` 依目标控件是否可编辑设置
+  `lv_group_set_editing()`；编辑态下方向键归光标，非编辑态归焦点移动。
+
 ## 环境变量
 
 | 变量 | 默认 | 说明 |
@@ -62,18 +76,33 @@ panel        设备 I/O         唯一知道硬件细节的一层
 | `QZ_RT_SERVER` | 同目录 `qzjs-rt` | JS 运行时可执行文件（qemu 下需指向包装脚本） |
 | `QZ_INPUT0` / `QZ_INPUT1` | `/dev/input/event0` / `event1` | 键盘 evdev（打不开则跳过） |
 | `QZ_AUTOEXIT_S` | — | 跑 N 秒后自行退出。自动化冒烟用，**不要**改用外部 `timeout`（会给进程组发 SIGTERM，误报成 JS 崩溃） |
+| `QZ_INPUT_DEBUG` | — | 逐跳打印 evdev 进队 / 出队到 LVGL 的键。键是唯一没有硬件反馈的输入，链路上任一环静默丢键都表现为「按了没反应」，没有这行只能靠猜 |
 | `QZ_UI_DEBUG` | — | 打印每条 UI op（`create` / `set`） |
 | `QZ_LOOP_DEBUG` | — | 打印 LVGL tick 计数与 loop 状态 |
 
-## 自测
+## 验证
+
+统一入口（从纯逻辑到端到端分层跑）：
 
 ```sh
-bash scripts/test-display.sh      # 纯逻辑层单测（133 断言，无需设备/LVGL）
-bash tools/rpc-ipc-selftest.sh    # uvrpc 外部 IPC 客户端调 sys.info
-bash tools/qemu-selftest.sh       # qemu-mipsel 跑真机产物
+bash scripts/verify-all.sh
 ```
 
-`test-display.sh` 覆盖条带寻址、掩码移位、边界裁剪、脏区对齐和 e-ink 刷新节奏——这些是最难靠屏上目视发现的部分。
+单条通道：
+
+| 脚本 | 覆盖 | 需要宿主构建 / 设备 |
+| --- | --- | --- |
+| `scripts/test-display.sh` | 显示纯逻辑：条带寻址、掩码移位、边界裁剪、脏区对齐、刷新决策（133 断言） | 否 / 否 |
+| `scripts/test-keymap.sh` | evdev 键码映射（82 断言，键码常量取自 `<linux/input.h>`） | 否 / 否 |
+| `scripts/verify-input.sh` | 键盘端到端（`QZ_INPUT0` 接 FIFO 回放）+ e-ink 刷新预算 | 是 / 否 |
+| `scripts/verify-frames.sh` | 原生 vs MIPS 帧逐字节一致（MIPS 经 qemu-user） | 是 / 否 |
+| `tools/rpc-ipc-selftest.sh` | uvrpc 外部 IPC 客户端调 `sys.info` | 是 / 否 |
+
+前两项是毫秒级的纯逻辑单测——上层现象不对时先确认它们是绿的，否则容易在上层猜错方向。
+
+**这些通道替代不了真机**：`/dev/epaper_lcd` 只写不可读，落屏波形、残影、真实 evdev 行为、刷新耗时与视觉本身，只能人眼在设备上看（另见 brain `port-verification`）。
+
+断言写成「语义」而不是黄金文件：换字体、改布局不该让测试红，而「方向键没移动焦点」这类真 bug 一定会被抓到。每条新断言都应做**变异测试**（把 bug 塞回去确认它会红），否则无法区分闸门和装饰。
 
 ## 真机部署
 
@@ -83,4 +112,16 @@ scp -r build-os-mips/js            device:/storage/qzos/
 # 设备上：QZ_DISPLAY=epaper QZ_JS_DIR=/storage/qzos/js /storage/qzos/qzos-host
 ```
 
-e-ink 约束（不可违反）：无定时动画/闪烁光标、只提交变化帧、定期全刷清残影、UI 字体只用 Fusion Pixel 位图（1bpp，无抗锯齿）。
+e-ink 约束（不可违反，违反任一条都是产品缺陷而非优化项）：
+
+- **无定时动画、无闪烁光标**——动画 = 每帧一次波形刷新。已踩：textarea 光标
+  400ms 闪烁（每敲一键刷 4~5 次）、默认主题按钮 120ms style transition
+  （每次点击多刷 3~4 次）。因此 `op_create` 对每个控件 `lv_obj_remove_style_all()`
+  后自己定死视觉，不继承为背光屏设计的主题样式。
+- **一次按键最多刷一次屏**——`verify-input.sh` 的刷新预算按 `1 + 按键数` 断言，
+  上下限都卡：上限挡动画回归，下限挡「测量失效」（例如日志格式一改导致 grep
+  数出 0 次刷新，上限断言会让 0 永远通过）。
+- **只提交变化帧**——LVGL 报脏不等于像素真的变了，`changed == 0` 必须一路传到
+  策略层，否则每次「重绘了但内容一样」都白刷一次。
+- **定期全刷清残影**（`QZ_FULL_EVERY`）。
+- **UI 字体只用 Fusion Pixel 位图**（1bpp，无抗锯齿）。
