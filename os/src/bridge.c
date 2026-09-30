@@ -204,6 +204,20 @@ static void op_create(cJSON *j)
         lv_obj_set_style_shadow_width(obj, 0, 0);
         lv_obj_set_style_pad_all(obj, 0, 0);
     }
+    if (strcmp(type, "ta") == 0) {
+        /* 光标不许闪。LVGL 的 textarea 光标是无限循环动画，闪一下就失效化
+         * 一块区域、刷一次屏——在这块 1bpp 墨水屏上等于每半秒一次全屏波形，
+         * 屏幕寿命和电量都撑不住（实测打字时每敲一键刷 4~5 次）。
+         * anim_duration=0 让光标常亮不闪：仍然看得见插入点，但只在它真的
+         * 移动时才产生一次刷新。
+         *
+         * 两个 selector 都要设：默认主题把 400ms 的闪烁挂在
+         * LV_PART_CURSOR|LV_STATE_FOCUSED 上（lv_theme_default.c 的
+         * ta_cursor 样式），只设 LV_PART_CURSOR 会被聚焦态那条盖掉。
+         * 推论：e-ink 宿主上任何 LVGL 动画都是 bug——动画即定时刷屏。 */
+        lv_obj_set_style_anim_duration(obj, 0, LV_PART_CURSOR);
+        lv_obj_set_style_anim_duration(obj, 0, LV_PART_CURSOR | LV_STATE_FOCUSED);
+    }
     if (qzos_input_group() &&
         (strcmp(type, "btn") == 0 || strcmp(type, "ta") == 0 ||
          strcmp(type, "cb") == 0 || strcmp(type, "list") == 0)) {
@@ -318,6 +332,18 @@ static void op_rpc(cJSON *j)
     if (pstr) free(pstr);
 }
 
+/* 焦点目标是否可编辑 -> group 是否进入编辑态。
+ *
+ * 这一步是把 LVGL 的"编辑态"暴露给 JS 的声明式入口：应用 focus 一个
+ * textarea 就意味着"用户要在这里打字"，此后方向键归光标、字符键归文本。
+ * 反过来 focus 按钮则退出编辑态，方向键重新用于移动焦点。
+ * 没有它，方向键在非编辑态会被 input.c 翻译成 NEXT/PREV（见 input.c 里的
+ * 说明），打字时光标就没法动了。 */
+static bool obj_is_editable(lv_obj_t *o)
+{
+    return lv_obj_check_type(o, &lv_textarea_class);
+}
+
 /* ---- entry ---- */
 
 void qzos_bridge_handle(const char *json, size_t len)
@@ -349,7 +375,12 @@ void qzos_bridge_handle(const char *json, size_t len)
     } else if (strcmp(op, "focus") == 0) {
         const char *id = cJSON_GetStringValue(cJSON_GetObjectItem(j, "id"));
         slot_t *s = id ? find_slot(id) : NULL;
-        if (s && qzos_input_group()) lv_group_focus_obj(s->obj);
+        if (s && qzos_input_group()) {
+            /* 编辑态跟着焦点走：焦点落在可编辑控件上就进编辑态（可以打字、
+             * 方向键归光标），否则退出（方向键归焦点移动）。 */
+            lv_group_set_editing(qzos_input_group(), obj_is_editable(s->obj));
+            lv_group_focus_obj(s->obj);
+        }
     } else if (strcmp(op, "refresh") == 0) {
         cJSON *full = cJSON_GetObjectItem(j, "full");
         /* 显式重绘 + 可选全刷波形。

@@ -90,7 +90,7 @@ target_link_libraries(qzos_uvrpc PUBLIC uv_a qzos_flatcc)
 # ----------------------------------------------------------------------------
 # Fusion Pixel 字体（1bpp 位图；见 brain qzos-ui-architecture 字体时间线）
 # ----------------------------------------------------------------------------
-file(GLOB QZOS_FONT_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/fonts/fusion_pixel_*.c)
+file(GLOB QZOS_FONT_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/fonts/fusion_pixel_*.c)
 if(NOT QZOS_FONT_SOURCES)
     message(FATAL_ERROR "no font sources — run scripts/gen-fonts.sh first")
 endif()
@@ -99,8 +99,11 @@ target_link_libraries(qzos_fonts PUBLIC lvgl)
 
 # ----------------------------------------------------------------------------
 # qzos-host：uv loop 泵 + LVGL 显示/输入 + JSON UI 桥 + uvrpc 服务面
+#
+# CONFIGURE_DEPENDS 不能省：没有它，新增 src/*.c 后构建照常"成功"，只是
+# 新文件根本没进二进制——keymap.c 就这样悄悄漏过一次（链接期才报 undefined）。
 # ----------------------------------------------------------------------------
-file(GLOB QZOS_HOST_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/src/*.c)
+file(GLOB QZOS_HOST_SOURCES CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/src/*.c)
 add_executable(qzos-host ${QZOS_HOST_SOURCES})
 target_include_directories(qzos-host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(qzos-host PRIVATE

@@ -30,6 +30,8 @@
 #include <string.h>
 #include <unistd.h>
 
+#include "keymap.h"
+
 #define EVQ_SIZE 32
 
 typedef struct {
@@ -67,61 +69,52 @@ static bool pop_event(evq_item_t *out)
 
 /* ---- keycode routing ---- */
 
-/* system keys go to the JS shell as JSON */
-static bool is_system_key(uint16_t code)
+/* 键码 -> 按键语义的映射在 keymap.c（纯逻辑、可单测）；这里只负责把
+ * 宿主语义翻成 LVGL 的 key 码。映射本身不写在��边是有原因的：字母段的
+ * evdev 码不连续，在 input.c 里用算术推字符会静默打错每个字母。 */
+
+/* 宿主按键语义 -> LVGL key */
+static uint32_t lv_key_of(qzos_key_t k, char c)
 {
-    switch (code) {
-    case KEY_HOME:
-    case KEY_BACK:
-    case KEY_VOLUMEUP:
-    case KEY_VOLUMEDOWN:
-    case KEY_WAKEUP:
-        return true;
-    default:
-        return false;
+    switch (k) {
+    case QZ_KEY_UP:        return LV_KEY_UP;
+    case QZ_KEY_DOWN:      return LV_KEY_DOWN;
+    case QZ_KEY_LEFT:      return LV_KEY_LEFT;
+    case QZ_KEY_RIGHT:     return LV_KEY_RIGHT;
+    case QZ_KEY_ENTER:     return LV_KEY_ENTER;
+    case QZ_KEY_ESC:       return LV_KEY_ESC;
+    case QZ_KEY_BACKSPACE: return LV_KEY_BACKSPACE;
+    case QZ_KEY_DEL:       return LV_KEY_DEL;
+    case QZ_KEY_NEXT:      return LV_KEY_NEXT;
+    case QZ_KEY_PREV:      return LV_KEY_PREV;
+    case QZ_KEY_HOME:      return LV_KEY_HOME;
+    case QZ_KEY_END:       return LV_KEY_END;
+    case QZ_KEY_CHAR:      return (uint32_t)(unsigned char)c;
+    case QZ_KEY_NONE:
+    default:               return 0;
     }
 }
 
-static const char *system_key_name(uint16_t code)
+/* 方向键 -> 焦点移动（仅非编辑态）
+ *
+ * 为什么必须在这里做：LVGL v9 的 keypad 只把 LV_KEY_NEXT / LV_KEY_PREV 当作
+ * "移动 group 焦点"，方向键要走 gridnav 才管用，而本项目 LV_USE_GRIDNAV=0
+ * （e-ink 单列 UI 用不上 grid，也不想为它引入布局约束）。于是把 evdev 方向键
+ * 直接交给 LVGL 的后果是：桌面应用列表**在真机上根本走不动**——设备键盘只有
+ * Enter/方向/Home/Back/OK，没有 Tab 也没有 PageUp/PageDown（见 C1Terminal
+ * keyboard.go），能触发 NEXT/PREV 的键一个都没有。
+ *
+ * 编辑态（焦点在 textarea 上，由 bridge 的 op:focus 设置）下方向键交还给控件
+ * 用于移动光标，不做这层翻译。 */
+static uint32_t adapt_arrows(qzos_key_t kind, uint32_t lv)
 {
-    switch (code) {
-    case KEY_HOME:       return "home";
-    case KEY_BACK:       return "back";
-    case KEY_VOLUMEUP:   return "volup";
-    case KEY_VOLUMEDOWN: return "voldown";
-    case KEY_WAKEUP:     return "wakeup";
-    default:             return NULL;
-    }
-}
-
-/* evdev code -> LVGL key; returns 0 if not representable */
-static uint32_t to_lv_key(uint16_t code)
-{
-    switch (code) {
-    case KEY_UP:        return LV_KEY_UP;
-    case KEY_DOWN:      return LV_KEY_DOWN;
-    case KEY_LEFT:      return LV_KEY_LEFT;
-    case KEY_RIGHT:     return LV_KEY_RIGHT;
-    case KEY_ENTER:     return LV_KEY_ENTER;
-    case KEY_OK:        return LV_KEY_ENTER;
-    case KEY_ESC:       return LV_KEY_ESC;
-    case KEY_BACKSPACE: return LV_KEY_BACKSPACE;
-    case KEY_DELETE:    return LV_KEY_DEL;
-    case KEY_TAB:       return LV_KEY_NEXT;
-    case KEY_PAGEUP:    return LV_KEY_PREV;
-    case KEY_PAGEDOWN:  return LV_KEY_NEXT;
-    case KEY_HOME:      return LV_KEY_HOME;
-    case KEY_END:       return LV_KEY_END;
-    case KEY_SPACE:     return ' ';
-    default:
-        /* letters a-z (evdev 30..38 = a..l, 44..50 = z..m, 16..25 = q..p) */
-        if (code >= KEY_Q && code <= KEY_P) return 'q' + (code - KEY_Q);
-        if (code >= KEY_A && code <= KEY_L) return 'a' + (code - KEY_A);
-        if (code >= KEY_Z && code <= KEY_M) return 'z' + (code - KEY_Z);
-        /* number row 1..0 (evdev 2..11) */
-        if (code >= 2 && code <= 11) return '1' + (code - 2); /* 2..11 -> 1..9,0 */
-        if (code == KEY_MINUS) return '-';
-        return 0;
+    if (lv_group_get_editing(qzos_input_group())) return lv;
+    switch (kind) {
+    case QZ_KEY_DOWN:
+    case QZ_KEY_RIGHT: return LV_KEY_NEXT;
+    case QZ_KEY_UP:
+    case QZ_KEY_LEFT:  return LV_KEY_PREV;
+    default:           return lv;
     }
 }
 
@@ -132,9 +125,9 @@ static void keypad_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
     (void)indev;
     evq_item_t ev;
     while (pop_event(&ev)) {
-        if (is_system_key(ev.code)) {
+        if (qzos_keymap_is_system(ev.code)) {
             if (ev.state == 1) {
-                const char *n = system_key_name(ev.code);
+                const char *n = qzos_keymap_system_name(ev.code);
                 if (n) qzos_bridge_send_key(n);
             }
             continue;
@@ -145,7 +138,14 @@ static void keypad_read_cb(lv_indev_t *indev, lv_indev_data_t *data)
             if (s_trace) fprintf(stderr, "[in] -> LVGL release key=0x%02x\n", data->key);
             return;
         }
-        uint32_t k = to_lv_key(ev.code);
+        /* 注意：必须分两步写。不能写成
+         *     lv_key_of(qzos_keymap_decode(code, &ch), ch)
+         * 函数实参的求值顺序在 C 里是未指定的，GCC 从右往左求值，于是 ch
+         * 在 decode 填它之前就被读走（恒为 0），所有字符键被判成"未映射"
+         * 静默丢弃——表现是"字母打不进去"，而日志里连一行都没有。 */
+        char ch = 0;
+        qzos_key_t kind = qzos_keymap_decode(ev.code, &ch);
+        uint32_t k = adapt_arrows(kind, lv_key_of(kind, ch));
         if (!k) continue; /* unmapped */
         s_last_key = k;
         data->key = k;
@@ -184,10 +184,9 @@ static void poll_cb(uv_poll_t *handle, int status, int events)
             uint16_t code = ie[i].code;
             uint8_t st = ie[i].value == 2 ? 2 : (uint8_t)ie[i].value;
             if (st == 2) {
-                /* repeat: only meaningful for nav/scroll keys */
-                if (code != KEY_UP && code != KEY_DOWN &&
-                    code != KEY_LEFT && code != KEY_RIGHT &&
-                    code != KEY_PAGEUP && code != KEY_PAGEDOWN) continue;
+                /* 长按连发只对导航键有意义：字母连发会往 textarea 里
+                 * 灌一串重复字符。 */
+                if (!qzos_keymap_repeatable(code)) continue;
                 st = 1;
             }
             if (!push_event(code, st) && s_trace)

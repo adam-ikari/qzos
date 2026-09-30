@@ -15,15 +15,28 @@ import struct
 import sys
 import time
 
-# Linux input-event codes actually routed by os/src/input.c
+# Linux input-event codes actually routed by os/src/input.c.
+#
+# 字母/数字**不能**用 ASCII 当 code：evdev 的 KEY_* 是历史遗留的错位表
+# （KEY_A=30、KEY_H=35、KEY_Z=44…），而且这些码和导航键的码段重叠——
+# 用 ASCII 会把 'h'(104) 变成 KEY_PAGEUP、'i'(105) 变成 KEY_LEFT，脚本
+# 于是"成功"地按下另一个键，测试通过而什么都没测到。
+# 同一张表见 C1Terminal keyboard.go / os/src/input.c to_lv_key()。
 CODES = {
     "up": 103, "down": 108, "left": 105, "right": 106,
     "enter": 28, "ok": 352, "esc": 1, "backspace": 14, "del": 111,
     "home": 102, "back": 158, "space": 57, "tab": 15,
     "pageup": 104, "pagedown": 109,
-    **{chr(c): c for c in range(ord("a"), ord("z") + 1)},
-    **{chr(c): c for c in range(ord("0"), ord("9") + 1)},
+    "1": 2, "2": 3, "3": 4, "4": 5, "5": 6,
+    "6": 7, "7": 8, "8": 9, "9": 10, "0": 11,
+    "q": 16, "w": 17, "e": 18, "r": 19, "t": 20, "y": 21, "u": 22,
+    "i": 23, "o": 24, "p": 25,
+    "a": 30, "s": 31, "d": 32, "f": 33, "g": 34, "h": 35, "j": 36,
+    "k": 37, "l": 38,
+    "z": 44, "x": 45, "c": 46, "v": 47, "b": 48, "n": 49, "m": 50,
 }
+# 同一个 code 不能有两种叫法：那会让脚本"合法"地发出一个和意图不同的键。
+assert len(set(CODES.values())) == len(CODES), "duplicate evdev code in CODES"
 # `struct timeval {i64/i32 secs; i64/i32 usec}` + u16 type + u16 code + s32 value
 LAYOUTS = {"x86_64": "qqHHi", "mips32": "iiHHi"}
 
