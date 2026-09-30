@@ -21,6 +21,9 @@ bash scripts/test-display.sh
 step "keymap unit tests (pure, no host build)"
 bash scripts/test-keymap.sh
 
+step "power domain decision layer (pure, no device)"
+bash scripts/test-power.sh
+
 step "app package + sandbox unit tests (real qzjs, no device)"
 bash scripts/test-apkg.sh
 

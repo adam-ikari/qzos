@@ -100,6 +100,26 @@ panel        设备 I/O         唯一知道硬件细节的一层
 **开机时 rt 起不来也不退出**：设备是墨水屏一体机，宿主一退就是黑屏，用户只能
 等电池耗尽或物理断电。留在退避循环里，qzjs-rt 一旦就位就自动起来。
 
+## 电源域
+
+`os/src/power.c` 是描述符层，形状照 `panel.c`（换设备只改一处）。设计稿
+[`docs/power-sim.md`](docs/power-sim.md)。
+
+**核心不变量：`key_owner == UNKNOWN ⇒ 一切写动作被拒。** 挡的是「双重处理」
+—— 若内核或厂商 pmd 已在收电源键而 qzos 也去 suspend 一次，症状是设备在两层
+逻辑间来回跳，真机上极难归因，因为两边都「看起来在工作」。
+
+当前所有设备事实**均未在真机验证**（台账 P1–P7，见 brain `qzos-power-sim`）。
+所以 `mp-d261-unverified` 描述符把 `cap_suspend`/`cap_shutdown` 都设成 false：
+若设备没有可写的 poweroff sysfs，「关机」只能靠 sysrq 或直接断电，可能损坏
+文件系统 —— 而这台设备熄屏后只能靠 USB ADB 救。宁可不做。
+
+插上设备后先跑探测（只读，不改设备）：
+
+```sh
+ADB="adb -s <serial>" scripts/probe-power-owner.sh
+```
+
 ## 授权面（app package）
 
 `os/js/apkg.js` 做 manifest 校验与信任判定，`os/js/sandbox.js` 在**加载任何应用
@@ -169,6 +189,7 @@ bash scripts/verify-all.sh
 | --- | --- | --- |
 | `scripts/test-display.sh` | 显示纯逻辑：条带寻址、掩码移位、边界裁剪、脏区对齐、刷新决策（133 断言） | 否 / 否 |
 | `scripts/test-keymap.sh` | evdev 键码映射（82 断言，键码常量取自 `<linux/input.h>`） | 否 / 否 |
+| `scripts/test-power.sh` | 电源域决策层（43 断言）。场景矩阵，重点是**归属未知时全拒** | 否 / 否 |
 | `scripts/test-apkg.sh` | 应用包校验 + 授权遮蔽（82 断言）。**跑在真实 qzjs 上**：核心断言是「`__native__` 那 57 个原生真被遮住了」，在 node 上跑等于什么都没测 | 原生 qzjs / 否 |
 | `os/test/test_shell_apps.sh` | 应用模型端到端：坏 manifest 被列出来但拒绝启动，**判据是画面像素** | 是 / 否 |
 | `os/test/verify-rt-recovery.sh` | JS 引擎崩溃恢复：杀 `qzjs-rt`，断言屏上出现提示、rt 被重建、桌面逐字节复现、开机失败也留在退避循环 | 是 / 否 |
