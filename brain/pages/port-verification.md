@@ -5,7 +5,7 @@ category: project
 status: active
 tags: [verification, device, perf]
 created: "2026-09-29T00:51:32"
-updated: "2026-09-30T03:36:12"
+updated: "2026-09-30T04:20:31"
 ---
 
 <!-- compiled_truth -->
@@ -36,29 +36,43 @@ updated: "2026-09-30T03:36:12"
 | 通道 | 覆盖 | 基线 |
 |---|---|---|
 | `test-display.sh` | 显示纯逻辑（条带寻址/阈值/脏区/刷新决策） | 133 断言 0 失败 |
-| `test-keymap.sh` | 键码映射（取自内核头 `linux/input.h`） | 82 断言 0 失败 |
-| `verify-input.sh` | 键盘全链路（evdev→LVGL→shell）+ e-ink 刷新预算 | 7 项断言全过 |
+| `test-keymap.sh` | 键码映射（键码常量取自 `linux/input.h`） | 82 断言 0 失败 |
+| `verify-input.sh` | 键盘端到端（evdev→LVGL→shell）+ 刷新预算 | 11 项断言全过 |
 | `verify-frames.sh` | 原生 vs MIPS **帧逐字节一致** | 5635 字节完全相同 |
 | `qemu-verify.sh` | qzjs 自身（version/eval/REPL/crypto/async/fetch） | 8/8 |
+| `tools/rpc-ipc-selftest.sh` | uvrpc 外部 IPC 客户端调 `sys.info` | OK |
+
+### 系统服务面（uvrpc）已独立验证的四条路径
+
+1. **uvrpc INPROC**：宿主进程内 server/client，同 loop，零拷贝。
+2. **uvrpc 外部 IPC**：Unix socket，`tools/rpc-ipc-selftest.sh` 用独立 C 客户端调 `sys.info` 并解析结果。
+3. **JS 侧封装**：`ui.rpc('sys.info', {})` → Promise，走 postMessage → bridge `op:rpc` → 响应回投 → 界面更新（`verify-input.sh` 的 services 断言覆盖）。
+4. **宿主 loop 注入**：uvrpc 不自己跑 `uv_run`，与 `lv_timer_handler` + qzjs 邮箱 fd watcher 共享单线程 loop。
 
 - MIPS 侧经 `qemu-mipsel-static` 跑；ISOLATED 双进程需要 rt trampoline（见 [[qemu-isolated-trampoline]]）。
 - 键盘回放：把 `QZ_INPUT0` 指向 FIFO，`os/test/replay-keys.py` 按真实 `struct input_event` 布局写入，宿主照常走 `uv_poll`。
 - **布局陷阱**：`struct input_event` 的大小随架构不同（x86_64 = 24，mips32 = 16，差在 timeval 里 time_t 的宽度）。喂错布局会被静默切成垃圾事件，所以 `--arch` 必须显式声明**消费者**的架构。
-- 场景断言语义而非黄金文件；关键那条是 **lifecycle**——进应用再退回来必须逐字节复现桌面帧（e-ink 每帧内容应是状态的纯函数），且前后两次是独立运行，不是自证。
 
-### 验证纪律（这部分比任何单条断言都重要）
+### 场景设计里两个不显然的点
+
+- **roundtrip（lifecycle）**：进应用再退回来必须**逐字节复现桌面帧**——e-ink 每帧提交的内容应是状态的纯函数；前后两次是独立运行，不是自证。
+- **tap**：按一个**留在屏上**的按钮。桌面上的 `enter` 紧接着 `ui.clear()` 把按钮销毁，按下态根本没被画出来——所以只测桌面场景会**完全漏掉**按下/抬起两态的渲染问题（主题动画回归就藏在这里，补上后才稳定测出：主题继承回去 = 6 次刷新 / 2 次按键，期望 3）。
+
+## 验证纪律（这部分比任何单条断言都重要）
 
 - **断言要问"这个键/操作*该*产生什么不同"，不是"有没有变化"。** 曾有一条 launch 断言在方向键完全是空操作时照样通过——空操作让 enter 启动的始终是第一个应用，而"帧变了"依然成立。这类"看起来在测、其实什么都没测"的断言比没有断言更危险。
-- **每条新断言都要做变异测试**：把对应 bug 塞回代码，确认它会红。否则无法区分"闸门"和"装饰"。已验证：去掉方向键适配 → nav+typing 挂；打开光标闪烁 → 刷新预算超限挂；还原实参求值顺序陷阱 → typing 挂。
+- **每条新断言都要做变异测试**：把对应 bug 塞回代码，确认它会红。否则无法区分"闸门"和"装饰"。已验证：去掉方向键适配 → nav+typing 挂；打开光标闪烁 → 刷新预算超限挂；还原实参求值顺序陷阱 → typing 挂；继承默认主题 → tap 超预算 + 焦点框不可见挂。
+- **测量本身要能失效并被察觉。** 刷新预算最初写成"提交次数 <= 上限"：把日志格式从 `commit ...` 改成 `[N ms] commit ...` 后 grep 数出 0 次，而 0 永远满足上限——闸门静默变成装饰。现在写成 `== 1 + 按键数` 并**同时卡上下限**：上限挡动画回归，下限挡测量失效。写成 `1 + n` 而不是魔数，是因为它直接表达 e-ink 的真实约束——一次按键最多刷一次屏。
 - **单测不能和被测代码抄同一张表。** 键码测试的常量取自内核头、只有期望字符是字面量，否则映射抄错时测试和代码一起错，永远测不出来。
 - **覆盖的顺序按"定位成本"从低到高**：纯逻辑单测（毫秒）→ 端到端场景（秒）→ 真机（不可自动化）。上层现象不对时，先确认下层闸门是绿的，否则容易在上层猜方向。
+- **不确定归因就说不确定。** 主题抖动的具体属性没有被单独隔离出来（变异测试显示起作用的是扁平化属性整体），这一点写进了代码注释而不是含糊成"已根治"。
 
 ## 仍缺的真机验证（不能被上面这些替代）
 
 - `/dev/epaper_lcd` 的**实际落屏**：波形选择是否被驱动接受、刷屏耗时、残影表现。
-- evdev **真实键码**与真机矩阵键盘行为（当前键码表以 `linux/input.h` 为准并与 C1Terminal `keyboard.go` 对齐，但真机矩阵映射仍需实按一遍确认）。
+- evdev **真实键码**与真机矩阵键盘行为（键码表以 `linux/input.h` 为准并与 C1Terminal `keyboard.go` 对齐，但真机矩阵映射仍需实按一遍确认）。
 - 墨水屏刷新期间的输入响应（面板阻塞时按键是否丢）。
-- 视觉本身：字体渲染、布局、CJK 断行，只能人眼在屏上看。
+- 视觉本身：字体渲染、布局、CJK 断行、焦点框粗细是否够醒目，只能人眼在屏上看。
 
 ## 上游行为备忘（非移植缺陷）
 
@@ -123,6 +137,24 @@ updated: "2026-09-30T03:36:12"
   affects: [port-verification]
 
 - time: 2026-09-30T03:36:12
+  kind: decision
+  summary: Rewrote compiled_truth to the new best understanding
+  source: brain update-truth
+  affects: [port-verification]
+
+- time: 2026-09-30T04:19:00
+  kind: decision
+  summary: "验证基线扩到 11 项端到端断言 + 4 条独立验证过的 RPC 路径。新增  场景（按一个**留在屏上**的按钮）是关键补充：桌面上的 enter 紧接着 ui.clear() 销毁按钮，按下态根本没被画出来，所以原有场景压根抓不到主题动画回归——补上它之后，主题继承回去能被稳定测出（tap = 6 次刷新 / 2 次按键，期望 3）。另新增 services 断言覆盖 sys.info 走完 postMessage→bridge op:rpc→uvrpc INPROC→响应回投 JS→界面更新。已独立验证四条 RPC 路径：uvrpc INPROC（in-process 按钮）、uvrpc 外部 IPC（tools/rpc-ipc-selftest.sh，Unix socket）、JS 侧 ui.rpc() 封装、以及宿主 loop 注入。刷新预算断言从「<= 上限」改成「== 1 + 按键数」并同时卡上下限：**下限是为挡测量失效**——本次真踩到，把日志格式从 'commit ...' 改成 '[N ms] commit ...' 后 grep 数出 0 次，而上限断言让 0 永远通过，闸门直接变装饰。"
+  source: "提交 960c21e / 0dedafb 后的验证状态盘点"
+  affects: [port-verification, qzos-ui-architecture, qzos-services-rpc]
+
+- time: 2026-09-30T04:19:44
+  kind: reversal
+  summary: "更正上一条：其中「新增 tap 场景」一句因 shell 反引号被当命令替换，tap 场景名在正文里被吞成了空缺。该场景确实存在且是本次最关键的新增（verify-input.sh 里的 run tap \"enter\" \"enter\"），原句其余内容成立。"
+  source: "自查：写入时反引号被 shell 求值"
+  affects: [port-verification]
+
+- time: 2026-09-30T04:20:31
   kind: decision
   summary: Rewrote compiled_truth to the new best understanding
   source: brain update-truth

@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [ui lvgl architecture bridge]
 created: "2026-09-29T21:19:37"
-updated: "2026-09-30T03:35:55"
+updated: "2026-09-30T04:18:36"
 ---
 
 <!-- compiled_truth -->
@@ -168,4 +168,10 @@ graph TB
   kind: decision
   summary: "键盘链路的三个真 bug 与两条 e-ink 硬约束（详见 compiled_truth）：(1) 字母键映射整段错——字母段 evdev 码不连续（KEY_Q=16/KEY_A=30/KEY_Z=44），用算术推字符导致 KEY_H->'f'、KEY_0->':'，改为 keymap.c 逐项写死并拆成不依赖 LVGL 的纯模块；(2) 方向键在真机上走不动——LVGL v9 keypad 只认 NEXT/PREV 移焦、方向键需 gridnav（本项目关闭），而设备键盘既无 Tab 也无 PageUp/PageDown，桌面列表因此无法操作，改为非编辑态把方向键翻成 NEXT/PREV，编辑态由 bridge 的 op:focus 按控件可编辑性设置；(3) textarea 光标 400ms 闪烁 = 每半秒刷一次墨水屏（默认主题挂在 LV_PART_CURSOR|LV_STATE_FOCUSED 上，只设 LV_PART_CURSOR 会被盖掉），打一个字符曾刷 4~5 次、改后正好 1 次。附带修一个 C 实参求值顺序陷阱（ch 在 decode 填它之前被读走，所有字符键静默丢弃）与 file(GLOB) 缺 CONFIGURE_DEPENDS（新增源文件未进二进制）。三个新断言均做变异测试确认会红。"
   source: "提交 167fc5f：键盘回归往下挖出的三个 bug"
+  affects: [qzos-ui-architecture, port-verification]
+
+- time: 2026-09-30T04:18:36
+  kind: decision
+  summary: "e-ink 第三条硬约束成型：不继承 LVGL 默认主题。根因是主题给按钮挂了 120ms 的 style transition（transition_delayed/transition_normal）+ LV_STATE_PRESSED 的 recolor/shadow，按下/抬起各触发逐帧动画→逐帧失效化→逐帧提交；实测按一个**留在屏上**的按钮多刷 3~4 次（相邻提交正好差一个 LV_DEF_REFR_PERIOD，在两种渲染间来回跳），而 1bpp 屏上按下态与常态本就看不出区别。修法：op_create 对每个控件 lv_obj_remove_style_all() 后自定视觉（白底黑字、无圆角/阴影/outline），焦点指示用加粗边框（1bpp 无颜色只有黑白粗细），字体是继承属性不受影响。顺带修焦点框不可见：之前只挂 LV_STATE_FOCUS_KEY，而 LVGL 只在 group 知道自身 indev 时才追加该 state（lv_obj.c LV_EVENT_FOCUSED 分支看 indev_type），拿不到就只给 LV_STATE_FOCUSED。诚实边界：具体是哪个主题属性造成的抖动**没有单独隔离**——变异测试显示保留 remove_style_all 但显式补齐属性同样不抖动，故 remove_style_all 是让约束结构化，真正锁回归的是刷新预算断言。诊断设施：QZ_DISPLAY_DEBUG 打出脏区矩形+变化 ASCII 图（'#'变黑/'o'变白/'.'没变）与毫秒时间戳——「多刷几次」只看 changed 字节数猜不出来源，看得见形状才知道是哪个控件在动。"
+  source: "提交 960c21e：查「按留在屏上的按钮为何多刷屏」"
   affects: [qzos-ui-architecture, port-verification]
