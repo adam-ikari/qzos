@@ -14,7 +14,9 @@ F="${1:-/tmp/qzos-frame.pbm}"
 [ -f "$F" ] || { echo "no frame at $F" >&2; exit 1; }
 
 python3 - "$F" <<'PY'
-import sys
+import signal, sys
+# 被 head/less 截断时安静退出：BrokenPipeError 打到 stderr 会盖掉真正的输出
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 path = sys.argv[1]
 data = open(path, 'rb').read()
 magic = data.split(None, 1)[0]

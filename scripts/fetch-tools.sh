@@ -44,12 +44,23 @@ fi
 # Idempotent: regenerated every run so a wiped .tools/bin/ never breaks the
 # cross build. .tools/ is gitignored, so this MUST be scriptable.
 mkdir -p "$TOOLS/bin"
-for cc in cc cxx; do
-  cat > "$TOOLS/bin/zig-$cc-mipsel" <<EOF
+# zig subcommand per wrapper: the driver is `c++`, not `cxx` (cxx is only a
+# filename convention). Getting this wrong makes the wrapper exit 2 with a
+# zig usage dump instead of compiling, which reads like a broken toolchain.
+for spec in "cc:cc" "cxx:c++"; do
+  name=${spec%%:*}
+  sub=${spec#*:}
+  cat > "$TOOLS/bin/zig-$name-mipsel" <<EOF
 #!/usr/bin/env bash
-exec "$TOOLS/zig/zig" $cc -target mipsel-linux-musleabihf "\$@"
+exec "$TOOLS/zig/zig" $sub -target mipsel-linux-musleabihf "\$@"
 EOF
-  chmod +x "$TOOLS/bin/zig-$cc-mipsel"
+  chmod +x "$TOOLS/bin/zig-$name-mipsel"
+done
+
+# Smoke-check both wrappers: a silently broken wrapper would only surface as a
+# confusing CMake "compiler not found"/compiler-id failure much later.
+for name in cc cxx; do
+  "$TOOLS/bin/zig-$name-mipsel" --version >/dev/null
 done
 
 echo "==> tools ready:"
