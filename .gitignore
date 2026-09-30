@@ -12,6 +12,10 @@ build-*/
 
 # 临时
 *.log
+
+# python 字节码（os/test/pbm_view.py 被闸门当模块 import，会生成 __pycache__）
+__pycache__/
+*.pyc
 tmp-*
 tmp*.c
 tmp*.sh

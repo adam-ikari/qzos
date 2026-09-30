@@ -1,4 +1,9 @@
 {
+  "schema": 1,
+  "id": "hello",
   "name": "Hello",
-  "entry": "app.js"
+  "version": "1.0.0",
+  "api": 1,
+  "entry": "app.js",
+  "perms": ["info"]
 }

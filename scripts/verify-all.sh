@@ -21,6 +21,12 @@ bash scripts/test-display.sh
 step "keymap unit tests (pure, no host build)"
 bash scripts/test-keymap.sh
 
+step "app package + sandbox unit tests (real qzjs, no device)"
+bash scripts/test-apkg.sh
+
+step "shell app model end-to-end (manifest gate, pixel assertions)"
+bash os/test/test_shell_apps.sh
+
 step "keyboard end-to-end (FIFO replay, semantic assertions)"
 bash scripts/verify-input.sh
 

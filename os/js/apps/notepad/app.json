@@ -1,4 +1,8 @@
 {
+  "schema": 1,
+  "id": "notepad",
   "name": "Notepad",
+  "version": "1.0.0",
+  "api": 1,
   "entry": "app.js"
 }

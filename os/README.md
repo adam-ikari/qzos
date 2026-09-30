@@ -79,7 +79,53 @@ panel        设备 I/O         唯一知道硬件细节的一层
 | `QZ_FAST_THRESHOLD` | `0` | 脏区占比 ≤ N% 时显式要求快速波形（`0` = 禁用，交给驱动选） |
 | `QZ_AUTO_COMMIT` | `1` | `0` = 只在显式 `refresh` op 时提交 |
 | `QZ_DISPLAY_DEBUG` | — | 每次提交多打脏区矩形 + 变化 ASCII 图（`#` 本次变黑 / `o` 变白 / `.` 没变）。查「无缘无故多刷屏」用：只看 `changed` 字节数猜不出来源，看得见形状才知道是哪个控件在动 |
-| `QZ_JS_DIR` | `js` | shell bundle 目录（ui.js / shell.js / apps） |
+
+## 授权面（app package）
+
+`os/js/apkg.js` 做 manifest 校验与信任判定，`os/js/sandbox.js` 在**加载任何应用
+之前**装好遮蔽面。设计见 [`docs/app-package.md`](docs/app-package.md)。
+
+- `perms` 填**能力**不是方法名；能力 `X` 授予 `sys.X` 与 `sys.X.*`，缺省为空
+  （default-deny）。能力表：`info` / `storage` / `settings` / `net` / `power`
+  （后两个等闸门 0，`power` 绝不默认授予）
+- 遮蔽必须**连 `globalThis.__native__` 一起做**——它实测暴露 57 个原生，含
+  `fsWrite`、`processSpawn`、`tcpConnect`、`contextSpawn`。只换 `qzjs.fs`
+  等于门遮了后门没遮
+- 面**永不还原**，只换指向哪个应用；否则 `back()` 还原真身这个动作本身会开洞
+- 目录信任目前**一律 fail-closed**：`statMode` 原语还没实现（JS 侧没有 `stat`），
+  所以用户应用的 `perms` 恒被清空
+
+## 帧的目检通道
+
+`/dev/epaper_lcd` 只写不可读，画面只能靠帧文件判断。`os/test/pbm_view.py` 把 1bpp
+帧渲染成 PNG（最近邻放大——1bpp 上任何插值都会把 1px 笔画糊成灰边，字就认不出了）：
+
+```sh
+python3 os/test/pbm_view.py /tmp/qzos-input/boot.pbm /tmp/boot.png --scale 3
+# 区域墨量：判「某块地方没有东西」（--max 缺省 -1 = 只测量不判定）
+python3 os/test/pbm_view.py --region f.pbm --at 4,126,288,24 --max 100
+```
+
+`os/js/apkg.js` 做 manifest 校验与信任判定，`os/js/sandbox.js` 在**加载任何应用
+之前**装好遮蔽面。设计见 [`docs/app-package.md`](docs/app-package.md)。
+
+- `perms` 填**能力**不是方法名；能力 `X` 授予 `sys.X` 与 `sys.X.*`，缺省为空
+  （default-deny）。表：`info` / `storage` / `settings` / `net` / `power`
+  （后两个等闸门 0，`power` 绝不默认授予）
+- 遮蔽必须**连 `globalThis.__native__` 一起做**——它实测暴露 57 个原生，含
+  `fsWrite`、`processSpawn`、`tcpConnect`、`contextSpawn`。只换 `qzjs.fs` 是
+  门遮了后门没遮
+- 面**永不还原**，只换指向哪个应用；否则 `back()` 还原真身这个动作本身会开洞
+- 目录信任目前**一律 fail-closed**：`statMode` 原语还没实现（JS 侧没有 `stat`），
+  所以用户应用的 `perms` 恒被清空
+
+## 自测
+
+### 环境变量
+
+| 变量 | 默认 | 说明 |
+| --- | --- | --- |
+| `QZ_JS_DIR` | `js` | shell bundle 目录（ui.js / shell.js / apkg.js / sandbox.js / apps） |
 | `QZ_APP_DIR` | `/storage` | 用户应用目录（与 `QZ_JS_DIR/apps` 合并扫描，`app.json` 为 manifest） |
 | `QZ_RPC_SOCK` | `/storage/qzos/rpc.sock` | uvrpc 外部 IPC 监听路径（`none` 关闭） |
 | `QZ_RT_SERVER` | 同目录 `qzjs-rt` | JS 运行时可执行文件（qemu 下需指向包装脚本） |
@@ -103,15 +149,21 @@ bash scripts/verify-all.sh
 | --- | --- | --- |
 | `scripts/test-display.sh` | 显示纯逻辑：条带寻址、掩码移位、边界裁剪、脏区对齐、刷新决策（133 断言） | 否 / 否 |
 | `scripts/test-keymap.sh` | evdev 键码映射（82 断言，键码常量取自 `<linux/input.h>`） | 否 / 否 |
+| `scripts/test-apkg.sh` | 应用包校验 + 授权遮蔽（82 断言）。**跑在真实 qzjs 上**：核心断言是「`__native__` 那 57 个原生真被遮住了」，在 node 上跑等于什么都没测 | 原生 qzjs / 否 |
+| `os/test/test_shell_apps.sh` | 应用模型端到端：坏 manifest 被列出来但拒绝启动，**判据是画面像素** | 是 / 否 |
 | `scripts/verify-input.sh` | 键盘端到端（`QZ_INPUT0` 接 FIFO 回放）+ e-ink 刷新预算 | 是 / 否 |
 | `scripts/verify-frames.sh` | 原生 vs MIPS 帧逐字节一致（MIPS 经 qemu-user） | 是 / 否 |
 | `tools/rpc-ipc-selftest.sh` | uvrpc 外部 IPC 客户端调 `sys.info` | 是 / 否 |
 
-前两项是毫秒级的纯逻辑单测——上层现象不对时先确认它们是绿的，否则容易在上层猜错方向。
+前三项是毫秒级的纯逻辑单测——上层现象不对时先确认它们是绿的，否则容易在上层猜错方向。
 
 **这些通道替代不了真机**：`/dev/epaper_lcd` 只写不可读，落屏波形、残影、真实 evdev 行为、刷新耗时与视觉本身，只能人眼在设备上看（另见 brain `port-verification`）。
 
 断言写成「语义」而不是黄金文件：换字体、改布局不该让测试红，而「方向键没移动焦点」这类真 bug 一定会被抓到。每条新断言都应做**变异测试**（把 bug 塞回去确认它会红），否则无法区分闸门和装饰。
+
+**判据要落在效果上，不是回执上。** 「日志里没有 launch 失败」是回执层断言——回执由 dispatch 路径无条件产出，与引擎有没有真拒绝无关（qzjs 的 interrupt 测试就是这么全绿的）。所以「坏包没执行」判的是**画面那一行有没有墨**（`pbm_view.py --region`）。
+
+**否定项必须配正对照。** 只测「坏包没出现」的话，一个「把所有包都拒掉」的实现也能全绿。所以 `test_shell_apps.sh` 里同一个包造两份、**只改 manifest**：合法那份必须出现标记（证明区域判据测得动），非法那份必须没有。阈值取正对照的一半而不是 0，否则一颗散点就让断言飘红而那种红不指向任何真问题。
 
 ## 真机部署
 
