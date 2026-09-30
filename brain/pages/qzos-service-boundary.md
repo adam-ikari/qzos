@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [architecture services authorization boundary]
 created: "2026-09-30T14:54:52"
-updated: "2026-09-30T15:20:57"
+updated: "2026-09-30T15:58:04"
 ---
 
 <!-- compiled_truth -->
@@ -104,3 +104,15 @@ JS 应用 ──ui.*────> 渲染桥（纯命令，无能力）
   summary: "收口落地：授权检查从 bridge.c 的 op_rpc 移到 services.c；引入穷举式注册表 s_registered[]（此前是「以 sys. 开头 + 前缀取 cap」的匹配，那等于给未实现的方法留了扇没锁的门）；新增 sys.storage.statfs（第一个真碰 OS 的服务，需要 storage 能力）作为收口是否真的收住的试金石；bridge.c 只转交 op:app、不再保存授权状态。测试自身抓出一个会让授权**静默给错**的 bug：qzos_services_set_app_perms 里写 s_app_caps[n] 而 n 是输入总数而非下标，授 2 个能力会两次都写进 index 2，结果是 3 个槽位里两个空串 + 一个 storage。另发现 default-deny 这条最关键的不变量**此前没有任何直接测试**（caps_allow 是 static，测试只能查存了几个能力、查不到未设授权时会不会放行），补了 qzos_services_would_allow 可观测钩子。3 个变异全部会红：服务面不检查 / 缺省放行 / 写错下标"
   source: "brain append-timeline：30 断言 + 3 变异测试 + 端到端 10 项 + MIPS 端到端 6 项"
   affects: [qzos-service-boundary, qzos-app-package]
+
+- time: 2026-09-30T15:57:58
+  kind: evidence
+  summary: "收口后自查抓到一个真洞并修掉：服务面有**两个入口**而我只守了一个。授权检查住在 qzos_services_rpc()（INPROC，JS 走的那条），而 IPC 监听器曾把 handler **直接**注册进去，完全绕过授权——实测宿主里一个应用都没跑，外部进程连上 /storage 上的 socket 就调通了 sys.storage.statfs 并拿到挂载信息；设备上 /storage 是 0777、socket 被 uvrpc 建成 0755，等于任何应用都能读存储布局，也让 power 能力那句「绝不默认授予」彻底作废。修法不是给 IPC 补授权（unix socket 没有可用的调用方身份，设备又是单用户 root 盒，uid 区分不出谁是谁），而是划清暴露面：需能力的方法一律不上 IPC，socket 收紧到 0600，扣下的每个方法都在启动日志里点名（否则「某服务在 IPC 上调不通」会被当 bug 查）。同时补 s_bound[]：uvrpc client 恒填 status=OK，注册失败时表里有、uvrpc 里没绑上，调用进空洞会返回「成功」+一坨二进制，现在改成明确的 service not bound"
+  source: "brain append-timeline：新闸门 scripts/test-ipc-surface.sh 8 断言 + 单测增至 38 断言 + 7 个变异全有归属"
+  affects: [qzos-service-boundary, qzos-app-package]
+
+- time: 2026-09-30T15:58:04
+  kind: note
+  summary: "**uvrpc 客户端无法分辨错误回执**（第三方限制，仓内修不了）：third_party/uvrpc 的 client 恒填 status=UVRPC_OK、error_code=0（uvrpc_client.c:158），而 server 对「handler 不存在」是把 int32 错误码塞进 result 头 4 字节 + 消息串（uvrpc_server.c:207）——线上没有标签可区分。于是任何 uvrpc 客户端都把失败看成成功。派生物：① 曾在 tools/qzos-rpc-client.c 按「头 4 字节非零即错误」解码，结果 sys.info 的 {\"se 被读成错误码 1702044283，**猜比不猜更糟**，已回退；② 判据改取宿主日志的 Handler not found（服务端权威记录）；③ 本仓免疫方式是派发前自己 svc_find() 且注册/派发同源于 s_registered[]，所以 handler 缺失不可达。**推论：任何基于 uvrpc 的判据都不能只读客户端回执**"
+  source: brain append-timeline
+  affects: [qzos-service-boundary, port-verification]

@@ -38,6 +38,24 @@ static void set_caps(const char *id, const char *a, const char *b)
     qzos_services_set_app_perms(id, caps, n);
 }
 
+/* 捕获 qzos_services_rpc 的回执。服务面没起时它是同步回调，所以不需要泵。 */
+typedef struct {
+    int *called;
+    int *success;
+    char *body;
+    size_t cap;
+} probe_ctx_t;
+
+static void probe_done(int ok, const char *json, size_t len, void *u)
+{
+    probe_ctx_t *c = (probe_ctx_t *)u;
+    *c->called = 1;
+    *c->success = ok;
+    size_t n = len < c->cap - 1 ? len : c->cap - 1;
+    memcpy(c->body, json, n);
+    c->body[n] = '\0';
+}
+
 int main(void)
 {
     /* ---- 注册表的基本性质 ---- */
@@ -77,6 +95,42 @@ int main(void)
             }
         }
         ok(1, "带能力的方法都在自己能力的命名空间下");
+    }
+
+    /* ---- IPC 公开面：需能力的方法一律不上 IPC ----
+     *
+     * 授权检查住在 qzos_services_rpc()，那是 INPROC 路径。IPC 路径没有可用的
+     * 调用方身份（unix socket；设备又是单用户 root，uid 区分不出谁是谁），
+     * 所以那里**补不了授权**，只能划清暴露面。
+     *
+     * 曾把 handler 直接注册进 IPC，于是外部进程完全绕过授权调通了
+     * sys.storage.statfs——宿主里一个应用都没跑。这条断言就是那个洞的形状；
+     * 效果层面（探两侧 + 正对照）由 scripts/test-ipc-surface.sh 钉。 */
+    {
+        int need_cap = 0, exposed = 0;
+        static const char *probe[] = {
+            "sys.info", "sys.storage.statfs", "sys.storage", "sys.power",
+            "sys.settings", "sys.net", "fsWrite", ""
+        };
+        for (unsigned i = 0; i < sizeof(probe) / sizeof(probe[0]); i++) {
+            const char *cap = qzos_services_method_cap(probe[i]);
+            if (!cap) continue;
+            need_cap++;
+            if (qzos_services_ipc_exposes(probe[i])) {
+                exposed++;
+                char msg[192];
+                snprintf(msg, sizeof(msg),
+                         "需 '%s' 能力的方法 '%s' 被暴露在 IPC 公开面上（授权可被绕过）",
+                         cap, probe[i]);
+                ok(0, msg);
+            }
+        }
+        ok(exposed == 0, "需能力的方法一律不上 IPC");
+        ok(qzos_services_ipc_exposes("sys.info"),
+           "sys.info 是纯只读元信息，可以公开");
+        ok(!qzos_services_ipc_exposes("fsWrite"), "表外的东西当然不在公开面上");
+        ok(!qzos_services_ipc_exposes(NULL), "NULL 不在公开面上");
+        ok(need_cap >= 1, "注册表里确实存在需能力的方法（否则上面几条是空的）");
     }
 
     /* ---- 能力要求是显式的，不靠前缀匹配 ----
@@ -174,6 +228,30 @@ int main(void)
         ok(qzos_services_app_caps(out, 8) <= 8, "超量能力被截断到上限内");
     }
     qzos_services_set_app_perms(NULL, NULL, 0);
+
+    /* ---- 服务面没起来时，调用必须响亮失败 ----
+     *
+     * uvrpc 的 client 恒把 status 填成 OK（third_party/uvrpc/src/uvrpc_client.c:158），
+     * 而 server 对「handler 不存在」是把 int32 错误码塞进 result 头 4 字节
+     * （uvrpc_server.c:207）。线上**没有标签**能让客户端分辨两者。
+     *
+     * 于是「表里有、uvrpc 里没绑上」是个静默失败：svc_find 说有，uvrpc 没 handler，
+     * 调用进空洞，返回「成功」+ 一坨二进制。所以派发前核 s_bound，把静默的
+     * 假成功换成明确的 service not bound。
+     *
+     * 本单测从不调 init，所以 s_bound 全是 false——正好是这条路径。 */
+    {
+        static char got[256];
+        probe_ctx_t ctx;
+        int called = 0, success = 0;
+        ctx.called = &called; ctx.success = &success; ctx.body = got; ctx.cap = sizeof(got);
+        got[0] = '\0';
+        qzos_services_rpc("sys.info", "{}", probe_done, &ctx);
+        ok(called == 1, "服务面没起来时调用仍会有回执（不是静默挂死）");
+        ok(success == 0, "服务面没起来时调用是失败（不是 ok:true + 二进制）");
+        ok(strstr(got, "service not bound") != NULL,
+           "回执指名 service not bound（而不是含糊的 rpc not ready）");
+    }
 
     if (failed == 0) {
         printf("OK: %d checks, 0 failed\n", checks);

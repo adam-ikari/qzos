@@ -27,6 +27,9 @@ bash scripts/test-power.sh
 step "system-service registry (the only JS->C boundary)"
 bash scripts/test-services.sh
 
+step "service-plane IPC surface (external procs must not reach cap methods)"
+bash scripts/test-ipc-surface.sh
+
 step "app package + sandbox unit tests (real qzjs, no device)"
 bash scripts/test-apkg.sh
 

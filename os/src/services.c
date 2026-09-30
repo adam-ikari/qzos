@@ -24,6 +24,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
+#include <sys/stat.h>
 #include <sys/statvfs.h>
 #include <time.h>
 #include <unistd.h>
@@ -76,6 +78,18 @@ static const svc_entry_t s_registered[] = {
 };
 #define N_REGISTERED ((int)(sizeof(s_registered) / sizeof(s_registered[0])))
 
+/* 每个方法是否**真的**绑到了 inproc server 上。
+ *
+ * 这不是冗余记账，是补一个静默失败：uvrpc 的 client 恒把 status 填成 OK
+ * （third_party/uvrpc/src/uvrpc_client.c:158），而 server 对「handler 不存在」
+ * 是把 int32 错误码塞进 result 的头 4 字节（uvrpc_server.c:207）。所以一旦
+ * 注册失败，本仓的调用方**看不出任何异常**——只会收到 ok:true 加一坨二进制。
+ *
+ * 而注册表是我们自己的唯一真相源：svc_find 会说「有这个方法」，uvrpc 那边却
+ * 没有 handler，调用就进了空洞。所以派发前必须核这一位，把静默的假成功换成
+ * 明确的 service-not-bound。 */
+static bool s_bound[N_REGISTERED];
+
 /* 能力检查：能力 X 授予 sys.X 与 sys.X.*。
  *
  * 保守实现：只在**注册表里显式声明了 cap** 的方法上按能力判定，其余（cap==NULL，
@@ -91,12 +105,18 @@ static bool caps_allow(const char *cap)
     return false;
 }
 
-static const svc_entry_t *svc_find(const char *method)
+static int svc_find_idx(const char *method)
 {
     for (int i = 0; i < N_REGISTERED; i++) {
-        if (strcmp(s_registered[i].method, method) == 0) return &s_registered[i];
+        if (strcmp(s_registered[i].method, method) == 0) return i;
     }
-    return NULL;
+    return -1;
+}
+
+static const svc_entry_t *svc_find(const char *method)
+{
+    int i = method ? svc_find_idx(method) : -1;
+    return (i >= 0) ? &s_registered[i] : NULL;
 }
 
 /* ---- JS 侧 RPC 入口（bridge.c 转发到这里）---- */
@@ -123,7 +143,8 @@ void qzos_services_rpc(const char *method, const char *params_json,
                        qzos_rpc_done_t done, void *u)
 {
     /* 1. 授权：能力不足就地拒绝，**不进 uvrpc**。这是收口后的唯一一道检查。 */
-    const svc_entry_t *e = svc_find(method);
+    int idx = method ? svc_find_idx(method) : -1;
+    const svc_entry_t *e = (idx >= 0) ? &s_registered[idx] : NULL;
     if (!e) {
         /* 未知方法：显式拒绝并说明「不在注册表内」。这比让它走到 uvrpc 再失败
          * 好——后者会把「我拼错了方法名」和「有权限但服务不存在」混成一个回执，
@@ -134,7 +155,20 @@ void qzos_services_rpc(const char *method, const char *params_json,
         done(0, err, (size_t)n, u);
         return;
     }
-    if (e->cap && !caps_allow(e->cap)) {
+    /* 表里有、uvrpc 里没绑上 ⇒ 明确失败。不能派发进空洞：uvrpc 的 client 恒把
+     * status 填成 OK，所以空洞里的调用会返回「成功」+ 一坨二进制错误负载，
+     * 排查时看到的是一个莫名其妙的成功。 */
+    if (!s_bound[idx]) {
+        char err[160];
+        int n = snprintf(err, sizeof(err),
+                         "{\"error\":\"service not bound\",\"method\":\"%s\"}", method);
+        done(0, err, (size_t)n, u);
+        return;
+    }
+    /* 判定走 qzos_services_would_allow()，不内联 caps_allow：单测测的是前者，
+     * 两处写同一规则的话，前者可以完全正确而执行点用着另一份——变异 1 就是
+     * 这么溜过去的（38 条单测全绿，只有端到端抓到）。 */
+    if (e->cap && !qzos_services_would_allow(method)) {
         char err[192];
         int n = snprintf(err, sizeof(err),
                          "{\"error\":\"permission denied\",\"method\":\"%s\","
@@ -306,9 +340,39 @@ bool qzos_services_would_allow(const char *method)
 
 /* 给闸门用的查询口。收口完成的判据是「注册表之外无 C 能力」，而这个判据
  * 必须能从仓外验证——所以把注册表暴露成可查询的，而不是让测试去猜。 */
+/* IPC 公开面的判定：cap==NULL 者才公开。与 qzos_services_init 里注册时的
+ * 过滤是同一条规则，但单独暴露出来是为了让闸门能核对「注册时过滤的和这里
+ * 判定的是同一批」——两处写同一规则时，那正是会漂移的地方。 */
+bool qzos_services_ipc_exposes(const char *method)
+{
+    const svc_entry_t *e = method ? svc_find(method) : NULL;
+    return e && e->cap == NULL;
+}
+
+int qzos_services_ipc_exposed_count(void)
+{
+    int n = 0;
+    for (int i = 0; i < N_REGISTERED; i++) {
+        if (!s_registered[i].cap) n++;
+    }
+    return n;
+}
+
 int qzos_services_method_count(void)
 {
     return N_REGISTERED;
+}
+
+/* 未真正绑到 inproc server 上的方法数。闸门在起过宿主之后断言它是 0。
+ * 之前注册失败只打一行日志，而调用方**收不到任何异常**（见 s_bound 的注释），
+ * 所以这一位必须能被测，不能只靠人看日志。 */
+int qzos_services_unbound_count(void)
+{
+    int n = 0;
+    for (int i = 0; i < N_REGISTERED; i++) {
+        if (!s_bound[i]) n++;
+    }
+    return n;
 }
 
 bool qzos_services_has_method(const char *method)
@@ -343,8 +407,10 @@ int qzos_services_init(uv_loop_t *loop)
     s_local = uvrpc_server_create(lc);
     if (s_local) {
         for (int i = 0; i < N_REGISTERED; i++) {
-            if (uvrpc_server_register(s_local, s_registered[i].method,
-                                       s_registered[i].handler, NULL) != UVRPC_OK)
+            bool okb = uvrpc_server_register(s_local, s_registered[i].method,
+                                             s_registered[i].handler, NULL) == UVRPC_OK;
+            s_bound[i] = okb;
+            if (!okb)
                 fprintf(stderr, "qzos-services: register '%s' failed\n",
                         s_registered[i].method);
         }
@@ -366,7 +432,21 @@ int qzos_services_init(uv_loop_t *loop)
         uvrpc_config_free(cc);
     }
 
-    /* external IPC listener (optional path: QZ_RPC_SOCK, default on /storage) */
+    /* external IPC listener (optional path: QZ_RPC_SOCK, default on /storage)
+     *
+     * **只注册 cap==NULL 的方法。** 这不是省略，是边界。
+     *
+     * 授权检查住在 qzos_services_rpc()，那是 INPROC 路径（JS 桥用的）。IPC
+     * 路径若把 handler 直接注册进去，就**完全绕过**授权——实测过：宿主里一个
+     * 应用都没跑，一个外部进程连上 socket 就调通了 sys.storage.statfs。
+     *
+     * 那条路没法补授权：unix socket 上没有可用的调用方身份。这台设备是
+     * 单用户 root 盒（uid 区分不出谁是谁），所以诚实的做法是划清暴露面——
+     * IPC = **公开面**（无需能力的只读元信息），INPROC = **特权面**（受应用
+     * perms 约束）。要能力的方法一律不上 IPC。
+     *
+     * 顺带收紧 socket 权限：uvrpc 默认建出 0755，设备上 /storage 是 0777，
+     * 于是「任何应用都能连」。降到 0600，让公开面也不至于谁都能连。 */
     const char *sock = getenv("QZ_RPC_SOCK");
     if (!sock) sock = "/storage/qzos/rpc.sock";
     if (*sock && strcmp(sock, "none") != 0) {
@@ -378,18 +458,46 @@ int qzos_services_init(uv_loop_t *loop)
         uvrpc_config_set_max_clients(ic, 8);
         s_ipc = uvrpc_server_create(ic);
         if (s_ipc) {
+            int exposed = 0, withheld = 0;
             for (int i = 0; i < N_REGISTERED; i++) {
+                /* 判据走 qzos_services_ipc_exposes()，不内联 `if (cap)`。
+                 *
+                 * 两处写同一规则时，那正是会漂移的地方：单测能测那条查询函数，
+                 * 而这里内联一份的话，查询函数可以完全正确、实际过滤却是错的
+                 * （曾就这样：变异掉内联判断，35 条单测全绿）。合并成一条路径后
+                 * 「规则」只有一个来源。
+                 *
+                 * 剩下的分工：查询函数保证**规则**（需能力 ⇒ 不公开），
+                 * scripts/test-ipc-surface.sh 保证**应用**（init 真的照它过滤）。 */
+                if (!qzos_services_ipc_exposes(s_registered[i].method)) {
+                    /* 需能力 → 不上 IPC。日志要说出来，否则「某个服务在 IPC 上
+                     * 调不通」会被当成 bug 去查，而真相是它故意不在那里。 */
+                    fprintf(stderr,
+                            "qzos-services: withholding '%s' from ipc "
+                            "(needs cap '%s')\n",
+                            s_registered[i].method, s_registered[i].cap);
+                    withheld++;
+                    continue;
+                }
                 if (uvrpc_server_register(s_ipc, s_registered[i].method,
                                            s_registered[i].handler, NULL) != UVRPC_OK)
                     fprintf(stderr, "qzos-services: register '%s' (ipc) failed\n",
                             s_registered[i].method);
+                else
+                    exposed++;
             }
             if (uvrpc_server_start(s_ipc) != UVRPC_OK) {
                 fprintf(stderr, "qzos-services: ipc server start failed (%s)\n", s_ipc_addr);
                 s_ipc = NULL;
                 s_ipc_addr[0] = '\0';
             } else {
-                fprintf(stderr, "qzos-services: ipc listening on %s\n", s_ipc_addr);
+                /* socket 建出来是 0755，设备上等于「谁都能连」；收紧到 0600。 */
+                if (chmod(sock, 0600) != 0)
+                    fprintf(stderr, "qzos-services: cannot chmod 0600 %s: %s\n",
+                            sock, strerror(errno));
+                fprintf(stderr, "qzos-services: ipc listening on %s "
+                                "(%d public method(s), %d withheld)\n",
+                        s_ipc_addr, exposed, withheld);
             }
         }
         uvrpc_config_free(ic);

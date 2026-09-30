@@ -19,6 +19,14 @@ static void on_resp(uvrpc_response_t *resp, void *ctx)
     (void)ctx;
     s_done = 1;
     s_ok = (resp->status == UVRPC_OK);
+    /* **不要**试图从 payload 猜错误。uvrpc 的 client 恒填 status=OK、
+     * error_code=0，而 server 把「Method not found」塞进 result 的头 4 字节
+     * + 消息串，两者**没有标签可区分**。曾按「头 4 字节非零即错误」解过，
+     * 结果合法响应也被误判：sys.info 的 `{"se` 读成错误码 1702044283。
+     * 猜比不猜更糟——它会把成功报成失败。
+     *
+     * 「handler 有没有被调用」的权威记录在**宿主日志**（`Handler not found`），
+     * 判据读那一侧。见 scripts/test-services.sh 的 IPC 用例。 */
     printf("status=%d result=[%.*s]\n", (int)resp->status,
            (int)resp->result_size, (const char *)resp->result);
 }

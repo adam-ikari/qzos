@@ -47,6 +47,13 @@ const char *qzos_services_method_cap(const char *method);
 /* 授权判定的可观测钩子（不执行调用，只回答「会不会被放行」）。
  * default-deny 的直接判据：没设授权时，带能力的方法一律 false。 */
 bool qzos_services_would_allow(const char *method);
+/* 该方法是否暴露在**外部 IPC 公开面**上。需能力的方法一律不上 IPC——
+ * 那条路上没有可用的调用方身份，无法授权。 */
+bool qzos_services_ipc_exposes(const char *method);
+int  qzos_services_ipc_exposed_count(void);
+/* 未真正绑到 inproc server 上的方法数；宿主起来之后应为 0。
+ * 注册失败若只打日志，调用方收不到任何异常（uvrpc client 恒填 status=OK）。 */
+int  qzos_services_unbound_count(void);
 
 /* ---- bridge: JSON UI protocol JS <-> LVGL (bridge.c) ---- */
 struct qz_t; /* qz_t */

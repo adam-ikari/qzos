@@ -140,6 +140,38 @@ JS（shell 与应用）碰到宿主 C 代码只有这一条路；UI 桥（`bridg
   等于「`sys.` 下任何方法名都可达」，而实际 handler 只有一个——那是给未来留了
   一扇没锁的门。
 
+### 两条路径，不是一条
+
+服务面有**两个入口**，这一点必须显式面对——早期只守了一个，于是 IPC 成了后门：
+
+| 路径 | 谁能到 | 暴露哪些方法 | 授权 |
+| --- | --- | --- | --- |
+| INPROC（`inproc://qzos`） | JS（shell + 应用） | 全部 | 应用 `perms`，default-deny |
+| IPC（`ipc://$QZ_RPC_SOCK`） | 设备上任意进程 | **只有 `cap == NULL` 的** | 无从授权 |
+
+IPC 那边**补不了授权**：unix socket 没有可用的调用方身份，而设备是单用户 root 盒
+（uid 区分不出谁是谁）。所以诚实的做法是划清暴露面——**需能力的方法一律不上 IPC**。
+曾经把 handler 直接注册进 IPC，实测：宿主里一个应用都没跑，一个外部进程连上
+`/storage` 上的 socket 就调通了 `sys.storage.statfs`。设备上 `/storage` 是 0777，
+socket 又被 uvrpc 建成 0755，等于「任何应用都能读你的存储布局」。现在扣下需能力的
+方法，并把 socket 收紧到 0600。
+
+### uvrpc 的错误回执在客户端不可辨（第三方限制）
+
+`third_party/uvrpc` 的 client **恒**填 `status = UVRPC_OK`、`error_code = 0`
+（`uvrpc_client.c:158`），而 server 对「handler 不存在」是把 `int32` 错误码塞进
+`result` 的头 4 字节 + 消息串（`uvrpc_server.c:207`）。线上**没有标签**能让客户端
+分辨成功结果和错误负载。
+
+后果：任何 uvrpc 客户端都会把失败看成成功。曾按「头 4 字节非零即错误」在
+`tools/qzos-rpc-client.c` 里解过，结果 `sys.info` 的 `{"se` 被读成错误码
+1702044283——**猜比不猜更糟**，已回退。判据改取**宿主日志**里的
+`Handler not found`（服务端权威记录，见 `scripts/test-ipc-surface.sh`）。
+
+本仓的免疫方式：派发前自己 `svc_find()`，且注册与派发同源于 `s_registered[]`，
+所以 handler 缺失不可达。注册失败仍可能发生（`uvrpc_server_register` 返回非 OK），
+此时由 `s_bound[]` 把静默的假成功换成明确的 `service not bound`——不能派发进空洞。
+
 ## 授权面（app package）
 
 `os/js/apkg.js` 做 manifest 校验与信任判定，`os/js/sandbox.js` 在**加载任何应用
@@ -210,14 +242,15 @@ bash scripts/verify-all.sh
 | `scripts/test-display.sh` | 显示纯逻辑：条带寻址、掩码移位、边界裁剪、脏区对齐、刷新决策（133 断言） | 否 / 否 |
 | `scripts/test-keymap.sh` | evdev 键码映射（82 断言，键码常量取自 `<linux/input.h>`） | 否 / 否 |
 | `scripts/test-power.sh` | 电源域决策层（43 断言）。场景矩阵，重点是**归属未知时全拒** | 否 / 否 |
-| `scripts/test-services.sh` | 系统服务注册表（30 断言）。**JS→C 唯一边界的可验证形态** | 部分 |
+| `scripts/test-services.sh` | 系统服务注册表（38 断言）。**JS→C 唯一边界的可验证形态**：注册表性质、default-deny、IPC 公开面规则、未绑定时报错 | 部分 |
+| `scripts/test-ipc-surface.sh` | 服务面**外部 IPC 半边**（8 断言）：外部进程调需能力的方法时 handler 从未被调用 + **正对照**（`sys.info` 必须调得通，否则「拒绝」可能只是客户端坏了）+ socket 权限 | 是 / 否 |
 | `scripts/test-apkg.sh` | 应用包校验 + 授权遮蔽（82 断言）。**跑在真实 qzjs 上**：核心断言是「`__native__` 那 57 个原生真被遮住了」，在 node 上跑等于什么都没测 | 原生 qzjs / 否 |
 | `os/test/test_shell_apps.sh` | 应用模型端到端：坏 manifest 被列出来但拒绝启动，**判据是画面像素** | 是 / 否 |
 | `os/test/verify-rt-recovery.sh` | JS 引擎崩溃恢复：杀 `qzjs-rt`，断言屏上出现提示、rt 被重建、桌面逐字节复现、开机失败也留在退避循环 | 是 / 否 |
 | `scripts/verify-input.sh` | 键盘端到端（`QZ_INPUT0` 接 FIFO 回放）+ e-ink 刷新预算 | 是 / 否 |
 | `scripts/verify-frames.sh` | 原生 vs MIPS 帧逐字节一致（MIPS 经 qemu-user） | 是 / 否 |
 | `scripts/verify-mips-e2e.sh` | MIPS 端到端：桌面/键盘/应用发现/授权遮蔽在 qemu-user 下逐条验 | 是 / 否 |
-| `tools/rpc-ipc-selftest.sh` | uvrpc 外部 IPC 客户端调 `sys.info` | 是 / 否 |
+| `tools/rpc-ipc-selftest.sh` | 手工探测：外部 IPC 客户端调 `sys.info`。**闸门是上面的 `test-ipc-surface.sh`** | 是 / 否 |
 
 前三项是毫秒级的纯逻辑单测——上层现象不对时先确认它们是绿的，否则容易在上层猜错方向。
 
