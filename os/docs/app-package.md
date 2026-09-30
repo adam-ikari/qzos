@@ -112,12 +112,10 @@ qzos 要作为**系统**替换设备上原有的程序（brain `qzos-as-system`�
   服务的面。一个应用要能调 `sys.storage`，只需要能力 `storage`。
 - **default-deny。** 没声明就是没有。
 
-### 强制点：必须落在 C 侧，不能落在 JS 侧
+### 宿主怎么知道「当前是哪个应用」
 
-检查点是 `bridge.c` 的 `op_rpc`，因为那里才看得到 `method` 字符串，而 JS 侧的
-任何检查都能被应用自己绕过。
-
-但 bridge 不知道「当前是哪个应用」——那是 shell 的事。所以需要一条新的 op：
+C 侧的 `op_rpc` 要能逐次比对，就必须知道当前应用——那是 shell 的事，所以需要
+一条新 op：
 
 ```json
 {"op":"app","id":"notepad","perms":["storage"]}   // shell 在 launch 前发
@@ -125,24 +123,90 @@ qzos 要作为**系统**替换设备上原有的程序（brain `qzos-as-system`�
 ```
 
 宿主把它存成「当前应用上下文」，`op_rpc` 逐次比对。**缺省上下文为空**，
-即没有 `op:app` 的调用一律按无授权处理。
+即没发过 `op:app` 的调用一律按无授权处理。shell 与宿主对同一份 perms 各持一份：
+C 用它守方法名，JS 用它装面——所以 manifest 解析与校验只应有一处实现。
 
-### 这条边界不是隔离（必须写清楚，否则会被当成安全沙箱）
+### 强制点：`op_rpc` 的检查在 C，遮蔽在 JS
 
-所有应用跑在**同一个 qzjs-rt 进程、同一个 QuickJS 上下文**里（brain
-`qzos-ui-architecture` 的三层结构）。所以：
+授权有**两个**执行点，缺一不可：
 
-- 它能挡住**误用**（顺手调了 `sys.power`）和**顺手写错的授权**（可审计的声明），
-  检查在 C 侧，应用绕不过去；
-- 它**挡不住**同上下文的恶意行为——应用能读写 shell 的全局状态、能读别的应用的
-  内存。真隔离要一应用一 context（qzjs 有 `qzContext`），那是后面的事。
+| 层 | 位置 | 挡什么 |
+| --- | --- | --- |
+| C | `bridge.c` 的 `op_rpc` | 越权方法名（`sys.power` / `sys.*` 命名空间） |
+| JS | launch 前装面（上一节） | 文件系统、`processSpawn`、TCP 等原生面 |
 
-最尖锐的一例是**文件系统完全不受这套机制管**：`qzjs.fs.writeFile` / `unlink`
-是对所有应用开放的全局能力，没有路径限制，应用可以直接改 `/storage` 下任何东西。
-同一上下文里没法把一个全局对象藏起来，所以这不是「忘了加检查」，而是结构性的
-（见 `os/docs/js-first.md` 的「已知代价」）。
+为什么 `op_rpc` 那层**不能**只放 JS：shell 与应用共享同一个 QuickJS 上下文，
+应用可以改写 shell 自己的 `ui.rpc`，所以放在 JS 的方法名检查能被应用自己撤销。
+而遮蔽面（fs/native）**必须**放 JS——那些是 JS 的全局对象，C 侧没有对应的
+过滤点（`__native__` 是一次性挂上的一整个对象，没有逐方法的宿主钩子）。
 
-v1 明确不做隔离，只做**声明 + 强制**。别把它当沙箱宣传。
+分工因此是：**C 守方法名边界，JS 守全局对象面。** 两者都要有。
+
+### 这条边界不是隔离：JS 注入能挡误用，挡不住蓄意攻击
+
+所有应用跑在**同一个 qzjs-rt 进程、同一个 QuickJS 上下文**里。分两层看：
+
+- **JS 注入能挡住**（下一节）：误用（顺手调了 `sys.power`、顺手写了包外路径）、
+  以及写错的授权。检查与遮蔽都在应用代码加载**之前**装好，应用绕不过去。
+- **挡不住**：同上下文的蓄意攻击——应用能读写 shell 的全局状态、能读别的应用
+  在同一堆里的内存。
+
+### 注入点：launch 之前装面，且永不还原
+
+授权的主要执行点放在 **JS 侧、加载应用之前**（`shell.js`，纯 JS，符合
+`js-first.md`）：
+
+```js
+// shell 启动时一次：
+var realNative = globalThis.__native__;   // 真身只进闭包
+var realFs     = qzjs.fs;                 // 读一次触发物化
+globalThis.__native__ = nativeFacade(realNative);   // 白名单式
+qzjs.fs           = fsFacade(realFs);               // 按 app 根 + 能力
+
+// launch(app) 时只换 current，不重建面：
+current = { dir: app.dir, perms: app.perms };
+// back() 时：current = null（面**留着**）
+```
+
+三条设计要点，都是被实测/读码逼出来的，不是风格选择：
+
+1. **必须同时遮 `__native__`，只遮 `qzjs.fs` 是演戏。** 实测
+   `globalThis.__native__` 暴露 **57 个原生**，含 `fsWrite`/`fsRemove`/`fsList`/
+   `fsWriteSync`、**`processSpawn`/`processTerminate`**、`contextSpawn`/`contextDestroy`、
+   `tcpConnect`/`tcpListen`、`httpRequest*`、`nativeEvalScript`、`selfPath`。
+   只换 `qzjs.fs` 的话，应用一句 `__native__.fsWrite(p, d)` 就过去了。
+
+2. **面永不还原，只换 `current`。** 若 `back()` 把真身放回去，应用先前排的
+   `setTimeout` 回调在还原之后触发，就会拿到真的 `qzjs.fs` —— 这就是"还原"这个
+   动作本身开的洞。面常驻、只换指向哪个应用，窗口消失。
+
+3. **不需要防 `delete`。** `lazyUnit` 首次物化时会把 accessor 整个删掉
+   （`polyfill/src/lazy.js`；实测 `qzjs.fs` 初始 `acc=true`、`configurable=true`），
+   所以应用 `delete qzjs.fs` 得到的是 `undefined`，**不会**重新物化出未遮蔽的真身。
+   fail-closed。
+
+补充两条已核实的边界：
+
+- `nativeEvalScript` 用 `JS_EVAL_TYPE_GLOBAL`，在**同一个 context 的 global** 里
+  求值，遮过的 global 它一样看得见，**不构成提权**。
+- 真身只能待在 shell 的闭包里：JS 枚举不到闭包变量，这是唯一安全的藏法。
+  `__native__` 本身是 `writable/configurable` 的普通数据属性，所以替换合法。
+
+### 剩下的洞（诚实写下来）
+
+- 应用仍能读写 shell 的全局状态（同一个 context）。**只有 per-app context 能解**。
+- 遮蔽是**合作式**的：它挡误用与写错的授权，不挡蓄意攻击同上下文。
+
+### 顺带发现：真隔离不必改引擎
+
+`__native__` 上有 `contextSpawn` / `contextSuspend` / `contextResume` /
+`contextDestroy`。也就是说**一应用一 QuickJS context 可以由 shell 在 JS 层编排**，
+不用改 qzjs：每个应用在自己的 context 里跑，shell 用
+`processPost`/`processOnMessage` 通信。这同时关掉上面唯一那条结构性洞
+（同上下文互相读写），并让「应用碰不到 shell 的面」变成天然成立。
+
+所以「`perms` 不是沙箱」不是 v1 认命，是有可达路径——但要先修 fs/`processSpawn`
+这两个实测确认的口子。
 
 ## 应用 API
 
@@ -200,5 +264,13 @@ v1 明确不做隔离，只做**声明 + 强制**。别把它当沙箱宣传。
 - **路径逃逸**：`entry: "../other/app.js"` 与 `api.require('../../etc/passwd')`
   都被拒。
 - **`id` 与目录名不符** → 拒绝启动。
+- **遮蔽真的挡住了（这几条是实测确认的口子，必须钉成回归）**：
+  - `typeof globalThis.__native__.fsWrite` 在应用里必须是 `undefined`
+  - 应用 `delete qzjs.fs` 之后 `qzjs.fs` 仍是 `undefined`（不是重新物化出真身）
+  - `__native__.processSpawn` / `tcpConnect` / `nativeEvalScript` 均不可见
+  - back 之后应用遗留的 `setTimeout` 回调**拿不到**真 `qzjs.fs`
+    （「面常驻」这条设计的回归）
+  - **只测 `qzjs.fs` 被遮是不够的**：必须同时断言 `__native__` 那一层，
+    否则「遮了门面没遮后门」会全绿
 
 每条都要做变异测试：把对应的检查删掉，确认它会红。

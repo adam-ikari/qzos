@@ -9,9 +9,14 @@
 
 1. **JS 够不到的 syscall**：没有 `statvfs`、没有 `poll/select`、没有 `ioctl`、
    没有 signal、没有进程创建。JS 的定时器与事件循环是宿主给的，不是内核接口。
-2. **必须待在应用上下文之外的东西**：授权强制点。因为系统（shell）和应用跑在
-   **同一个 QuickJS 上下文**里，JS 侧的任何检查都能被应用自己绕过——放在 JS
-   里的权限检查等于没放。这是 JS-first 的**唯一安全例外**。
+2. **应用能自己撤销的那种检查**：具体指**方法名边界**（`op:rpc`）。应用能改写
+   shell 自己的 `ui.rpc` 实现，所以「在 JS 里比对一次方法名」这种检查拦不住
+   它——必须落在 C 侧。
+
+注意第 2 条的范围：它**只**适用于应用**持有引用**的检查。**闭包里的检查是
+有效的**——JS 枚举不到闭包变量，所以「launch 前把 `qzjs.fs` 换成闭包捕获真身的
+过滤面」这类做法应用绕不过去。正因为如此，授权的**主要执行点在 JS**
+（见 `os/docs/app-package.md`），C 那道 `op_rpc` 是补方法名这条边界，不是主体。
 
 渲染（LVGL）归入第 1 类的延伸：JS 没有像素概念。
 
@@ -38,9 +43,10 @@ qzjs.fs 是 async 的；`readFileSync` 直接抛异常，别指望同步文件 I
 | --- | --- | --- |
 | 桌面、窗口、应用生命周期、启动顺序 | **JS** | `os/js/shell.js` |
 | 应用模型：发现、manifest 校验、授权策略、包管理 | **JS** | 待实现（[[app-package]]） |
+| **应用授权执行点**（fs / native 面的遮蔽） | **JS** | launch 前装面，见 `app-package.md` |
 | 系统服务：**策略与组合** | **JS** | 阈值、格式、告警、状态机 |
 | 系统服务：硬件原语 | **C** | `sys.statvfs` / 波形 ioctl / 电源 ioctl |
-| **授权强制点** | **C** | `bridge.c` 的 `op_rpc`（判据 2） |
+| 方法名边界 | **C** | `bridge.c` 的 `op_rpc`（判据 2，补边界非主体） |
 | 输入 | **C** | evdev `uv_poll` + read（JS 无 poll） |
 | 渲染 | **C** | LVGL + 显示四段分层（见 `os/README.md`） |
 | 传输 | **C** | qzjs 邮箱 fd + uvrpc（已是 C，不动） |
@@ -74,15 +80,21 @@ C bridge: op_rpc ── 授权检查（判据 2，必须留在这里）
    自由字节数要能对上 `statvfs` 真值，不是「RPC 回了东西」。
 2. **授权强制点必须留在 C。** 这是判据 2 的直接后果，也是 JS-first 唯一的
    安全例外；把它挪到 JS 会让整套 perms 变成装饰。
-3. **`qzjs.fs.writeFile` / `unlink` 现在对所有应用完全开放**，没有路径限制。
-   所以 [[app-package]] 的 `perms` **只管住服务面，管不住文件系统**：应用可以
-   直接改 `/storage` 下任何东西。这不是「忘了加检查」——同一上下文里没法把一个
-   全局对象对应用藏起来，所以它是结构性的。
-   - 结构性解法：**一应用一 `qzContext`**（qzjs 已支持），配受限的 fs 绑定。
-   - 过渡期的诚实说法：`perms` 是**服务面的授权，不是沙箱**。文档、UI、命名
-     都不要暗示后者。
-   - 副作用：这条同时是「上 per-app context」的最强论据——它比 `power` 关机
-     那种具体风险更根本。
+3. **应用授权的主要执行点在 JS，不在 C。** 详见 `os/docs/app-package.md`：
+   shell 在加载应用**之前**装好「面」（facade），把 `qzjs.fs` 与
+   `globalThis.__native__` 换成按当前应用授权过滤的版本。
+   - 实测 `__native__` 暴露 **57 个原生**，含 `fsWrite`/`fsRemove`/`fsWriteSync`、
+     **`processSpawn`**、`tcpConnect`/`tcpListen`、`contextSpawn`/`contextDestroy`、
+     `nativeEvalScript`、`selfPath`。**只遮 `qzjs.fs` 是演戏**，必须连 `__native__`
+     一起遮。
+   - **面永不还原，只换指向哪个应用**：否则 back() 之后应用遗留的定时器回调会
+     拿到真的 `qzjs.fs`。
+   - C 侧仍留一道 `op_rpc` 方法名检查——因为应用能改写 shell 的 `ui.rpc`，
+     JS 侧的方法名检查能被应用自己撤销。**分工是 C 守方法名、JS 守全局对象面。**
+   - `nativeEvalScript` 是 `JS_EVAL_TYPE_GLOBAL`，同 context 求值，**不构成提权**。
+   - 剩下唯一的结构性洞是「同上下文互相读写」，而 `__native__` 上的
+     `contextSpawn`/`contextDestroy` 表明**一应用一 `qzContext` 可由 shell 在
+     JS 层编排，不必改引擎**——这是 JS-first 少写 C 反而更干净的一个例子。
 4. **JS-first 会让 `shell.js` 变大。** shell 已经 171 行，再加应用模型、授权策略、
    服务注册会到 400+ 行。届时按职责拆模块（用 [[app-package]] 的
    `api.require` 同一套加载约定），别让 shell 变成一个大泥球。
