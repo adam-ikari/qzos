@@ -2,6 +2,15 @@
 
 三层结构：`qzjs-rt`（JS 应用进程）· JSON UI 桥 · `qzos-host`（LVGL + epaper + evdev + uvrpc，单线程单 libuv loop）。
 
+## 设计稿
+
+| 文档 | 内容 |
+| --- | --- |
+| [`docs/js-first.md`](docs/js-first.md) | JS 优先分层：写 C 的两个正当理由、哪些一律不写 C、服务面「JS 优先 C 兜底」 |
+| [`docs/app-package.md`](docs/app-package.md) | 应用包结构：manifest 契约、能力式 default-deny 授权、信任与校验规则 |
+
+两条都还没实现。brain 侧对应 [[qzos-js-first]] / [[qzos-app-package]]。
+
 ## 构建
 
 ```sh
