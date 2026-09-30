@@ -12,3 +12,10 @@ build-*/
 
 # 临时
 *.log
+tmp-*
+tmp*.c
+tmp*.sh
+tmp*.py
+tmp*.js
+tmp*.md
+

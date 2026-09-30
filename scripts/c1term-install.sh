@@ -48,13 +48,20 @@ chmod +x /tmp/c1term-run.sh /tmp/c1term-stop.sh
 "${ADB_CMD[@]}" push /tmp/c1term-run.sh /tmp/c1term-stop.sh $D/ >/dev/null
 "${ADB_CMD[@]}" shell "chmod +x $D/c1term-run.sh $D/c1term-stop.sh"
 
+# Wi-Fi CLI, on the terminal's PATH
+"${ADB_CMD[@]}" push "$(dirname "$0")/c1wifi" "$D/bin/c1wifi" >/dev/null
+"${ADB_CMD[@]}" shell "chmod 755 $D/bin/c1wifi"
+
 cat <<EOF
 
 Installed. Usage:
-  Interactive REPL on the e-ink screen:
-    "${ADB_CMD[0]}" ${ADB_CMD[*]:1} shell /usr/data/c1term/c1term-run.sh &   # then use keyboard
-    type:  qzjs     (PATH includes $D/bin)
-    HOME key exits and restores the stock desktop.
+  Interactive REPL on the e-ink screen — one shot, from the project root:
+    ADB="${ADB[0]} ${ADB_CMD[*]:1}" scripts/on-device-repl.sh
+  or from the desktop: pick the 'terminal' app (scripts/c1term-launcher-app.sh --install).
+  Inside the terminal:
+    qzjs        JS REPL (PATH includes $D/bin)
+    c1wifi      Wi-Fi: scan / join <ssid> <psk> / status / off
+    HOME        exits and restores the stock desktop
   If anything gets stuck:
     "${ADB_CMD[0]}" ${ADB_CMD[*]:1} shell /usr/data/c1term/c1term-stop.sh
 EOF

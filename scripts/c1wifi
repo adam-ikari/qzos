@@ -1,0 +1,210 @@
+#!/bin/sh
+# c1wifi — Wi-Fi configuration for the C1 Slim, for use inside the terminal.
+#
+# Radio bring-up and teardown are delegated to the vendor scripts (/bin/wifi_up.sh
+# and /bin/wifi_down.sh): the atbm603x module is insmod'd on demand, and the
+# vendor path also starts wpa_supplicant and the DHCP client with the right
+# arguments. Credentials are managed through wpa_cli, which writes them back into
+# /usr/resource/wpa_supplicant.conf (the file wifi_up.sh actually reads, with
+# update_config=1) — not the desktop's own copy under /usr/data/c1/wifi.
+set -u
+
+CONF=${C1WIFI_CONF:-/usr/resource/wpa_supplicant.conf}
+IFACE=${C1WIFI_IFACE:-wlan0}
+CTRL=${C1WIFI_CTRL:-/var/run/wpa_supplicant}
+
+die() { printf 'c1wifi: %s\n' "$*" >&2; exit 1; }
+
+wc_() { wpa_cli -p "$CTRL" -i "$IFACE" "$@" 2>/dev/null; }
+
+supplicant_up() { [ -n "$(wc_ status)" ]; }
+
+radio_up() {
+    [ -d "/sys/class/net/$IFACE" ] || {
+        printf 'radio down — loading Wi-Fi module (takes a few seconds)\n'
+        /bin/wifi_up.sh >/tmp/c1wifi-up.log 2>&1 ||
+            { printf 'wifi_up.sh failed:\n' >&2; tail -3 /tmp/c1wifi-up.log >&2; return 1; }
+    }
+    supplicant_up && return 0
+    i=0
+    while ! supplicant_up; do
+        i=$((i + 1))
+        [ $i -lt 20 ] || break
+        sleep 0.5
+    done
+    supplicant_up
+}
+
+check_name() {
+    # The supplicant config quotes these; a double quote would let a value end
+    # its own field and inject directives.
+    case "$2" in
+        *'"'*) die "$1 may not contain a double quote" ;;
+    esac
+}
+
+net_id_for() {
+    # $1 = ssid; echoes the supplicant network id, or nothing
+    wc_ list_networks | awk -F'\t' -v s="$1" '$2 == s { print $1; exit }'
+}
+
+cmd_status() {
+    printf 'interface  : '
+    if [ -d "/sys/class/net/$IFACE" ]; then
+        printf '%s (radio present)\n' "$IFACE"
+    else
+        printf '%s (radio down)\n' "$IFACE"
+        return 0
+    fi
+    state=$(wc_ status | awk -F= '$1 == "wpa_state" { print $2 }')
+    printf 'wpa_state  : %s\n' "${state:-supplicant not running}"
+    printf 'ssid       : %s\n' "$(iwconfig "$IFACE" 2>/dev/null | sed -n 's/.*ESSID:"\([^"]*\)".*/\1/p')"
+    printf 'link       : %s\n' "$(iwconfig "$IFACE" 2>/dev/null | sed -n 's/.*Link Quality=\([^ ]*\).*/\1/p')"
+    printf 'ipv4       : %s\n' "$(ip -4 -o addr show dev "$IFACE" 2>/dev/null | awk '{print $4}' | tr '\n' ' ')"
+    printf 'gateway    : %s\n' "$(ip route 2>/dev/null | awk '/^default/ {print $3; exit}')"
+    printf 'nameserver : %s\n' "$(grep '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' | tr '\n' ' ')"
+}
+
+cmd_scan() {
+    radio_up || die 'could not reach wpa_supplicant; try: c1wifi off'
+    wc_ scan >/dev/null
+    i=0
+    while [ $i -lt 20 ]; do
+        n=$(wc_ scan_results | grep -c . )
+        [ "${n:-0}" -gt 1 ] && break
+        i=$((i + 1))
+        sleep 1
+    done
+    wc_ scan_results | awk -F'\t' 'NR > 1 {
+        ssid = $5; if (ssid == "") ssid = "(hidden)"
+        enc = "open"
+        if ($4 ~ /WPA|RSN/) enc = "WPA/WPA2"
+        else if ($4 ~ /WEP/) enc = "WEP"
+        printf "%-34s  %-5s  %s\n", ssid, $3, enc
+    }' | sort -u
+}
+
+cmd_list() {
+    if supplicant_up; then
+        wc_ list_networks | awk -F'\t' 'NR > 1 { printf "%-3s %-34s %s\n", $1, $2, $3 }'
+    else
+        printf '(radio down — reading %s)\n' "$CONF"
+        awk -F'"' '/^[ \t]*ssid=/ { print "    " $2 }' "$CONF" 2>/dev/null
+    fi
+}
+
+cmd_join() {
+    ssid=${1:-}
+    psk=${2-}
+    [ -n "$ssid" ] || die 'usage: c1wifi join <ssid> [psk]   (no psk = open network)'
+    check_name ssid "$ssid"
+    [ -n "$psk" ] && check_name psk "$psk"
+
+    radio_up || die 'could not reach wpa_supplicant; try: c1wifi off'
+
+    id=$(net_id_for "$ssid")
+    if [ -z "$id" ]; then
+        id=$(wc_ add_network | tail -1)
+        case "$id" in ''|*[!0-9]*) die 'supplicant refused to add a network' ;; esac
+    fi
+
+    wc_ set_network "$id" ssid "\"$ssid\"" >/dev/null || die 'set ssid failed'
+    if [ -z "$psk" ]; then
+        wc_ set_network "$id" key_mgmt NONE >/dev/null || die 'set key_mgmt failed'
+    else
+        hex=yes
+        [ ${#psk} -eq 64 ] || hex=no
+        case "$psk" in *[!0-9a-fA-F]*) hex=no ;; esac
+        if [ "$hex" = yes ]; then
+            wc_ set_network "$id" psk "$psk" >/dev/null || die 'set psk failed'
+        else
+            wc_ set_network "$id" psk "\"$psk\"" >/dev/null || die 'set psk failed'
+        fi
+        wc_ set_network "$id" key_mgmt WPA-PSK >/dev/null || die 'set key_mgmt failed'
+    fi
+    wc_ select_network "$id" >/dev/null
+    wc_ enable_network "$id" >/dev/null || die 'enable_network failed'
+    wc_ save_config >/dev/null || printf 'note: supplicant did not write %s\n' "$CONF" >&2
+    printf 'saved "%s" to %s\n' "$ssid" "$CONF"
+
+    printf 'associating'
+    i=0
+    state=''
+    while [ $i -lt 30 ]; do
+        state=$(wc_ status | awk -F= '$1 == "wpa_state" { print $2 }')
+        [ "$state" = COMPLETED ] && break
+        printf '.'
+        i=$((i + 1))
+        sleep 1
+    done
+    printf '\n'
+    if [ "$state" != COMPLETED ]; then
+        printf 'no association after 30s — check the password with: c1wifi scan\n' >&2
+        return 1
+    fi
+
+    printf 'obtaining an address'
+    i=0
+    addr=''
+    while [ $i -lt 20 ]; do
+        addr=$(ip -4 -o addr show dev "$IFACE" scope global 2>/dev/null | awk '{print $4; exit}')
+        [ -n "$addr" ] && break
+        printf '.'
+        i=$((i + 1))
+        sleep 1
+    done
+    printf '\n'
+    if [ -n "$addr" ]; then
+        printf 'connected: %s  %s\n' "$ssid" "$addr"
+    else
+        printf 'associated but no DHCP lease yet; retry shortly with: c1wifi status\n' >&2
+        return 1
+    fi
+}
+
+cmd_forget() {
+    ssid=${1:-}
+    [ -n "$ssid" ] || die 'usage: c1wifi forget <ssid>'
+    supplicant_up || die 'the radio must be up to edit networks; run: c1wifi join or c1wifi scan first'
+    id=$(net_id_for "$ssid")
+    [ -n "$id" ] || die "no saved network named \"$ssid\""
+    wc_ remove_network "$id" >/dev/null || die 'remove_network failed'
+    wc_ save_config >/dev/null
+    printf 'forgotten "%s"\n' "$ssid"
+}
+
+cmd_off() {
+    /bin/wifi_down.sh >/dev/null 2>&1
+    printf 'radio off\n'
+}
+
+usage() {
+    cat <<'EOF'
+c1wifi — Wi-Fi for the C1 Slim terminal
+
+  c1wifi                 current connection, address, gateway, DNS
+  c1wifi scan            access points in range (brings the radio up)
+  c1wifi join <ssid> [psk]
+                         connect and save; omit psk for an open network
+  c1wifi list            saved networks
+  c1wifi forget <ssid>   drop a saved network
+  c1wifi off             unload the radio
+
+Passwords with a double quote are not supported. WEP networks are not
+supported. Credentials land in /usr/resource/wpa_supplicant.conf, the file the
+vendor wifi_up.sh reads; the desktop's Wi-Fi page uses the same stack.
+EOF
+}
+
+cmd=${1:-status}
+[ $# -gt 0 ] && shift
+case "$cmd" in
+    status) cmd_status "$@" ;;
+    scan)   cmd_scan "$@" ;;
+    join)   cmd_join "$@" ;;
+    list)   cmd_list "$@" ;;
+    forget) cmd_forget "$@" ;;
+    off)    cmd_off "$@" ;;
+    -h|--help|help) usage ;;
+    *) usage >&2; die "unknown command: $cmd" ;;
+esac

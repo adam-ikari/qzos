@@ -1,3 +1,9 @@
 [submodule "qzjs"]
 	path = qzjs
 	url = https://github.com/adam-ikari/qzjs.git
+[submodule "third_party/lvgl"]
+	path = third_party/lvgl
+	url = https://github.com/lvgl/lvgl.git
+[submodule "third_party/uvrpc"]
+	path = third_party/uvrpc
+	url = https://github.com/adam-ikari/uvrpc.git

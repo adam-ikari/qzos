@@ -26,7 +26,10 @@ scripts/build-mips.sh      交叉编译 qzjs（Release + QZ_PROFILE=minimal）
 scripts/qemu-verify.sh     无设备验证：qemu-user 下跑 REPL/加密/流/定时器冒烟测试
 scripts/deploy-device.sh   adb push 到 /storage/c1/qzjs/ 并做设备端冒烟
 scripts/c1term-install.sh  构建产物 C1Terminal 装机 + qzjs 挂 PATH + 屏上 REPL 启停桥
-scripts/on-device-repl.sh  一键拉起屏上 REPL（--stop 恢复桌面）
+scripts/c1wifi             终端内的配网 CLI（随 c1term-install 装到 $D/bin）
+scripts/c1term-launcher-app.sh  把终端注册成 C1ancher 的应用（launcher 里选它即开）
+scripts/c1term-autostart.sh     可选：开机自启终端（默认未启用）
+scripts/on-device-repl.sh  一键从 adb 拉起屏上 REPL（--stop 恢复桌面）
 ```
 
 ## 构建
@@ -50,25 +53,48 @@ scripts/qemu-verify.sh     # 期望输出 8 passed, 0 failed
 
 ```bash
 ADB=adb scripts/deploy-device.sh        # 或 ADB=/mnt/c/.../adb.exe 走 Windows adb
+ADB=adb scripts/c1term-install.sh       # C1Terminal + qzjs + c1wifi
+ADB=adb scripts/c1term-launcher-app.sh --install   # 桌面 launcher 里的 terminal 应用
 ```
 
-设备上（已装 C1Terminal 时）：
+### 从 launcher 启动（日常用法）
 
-1. 启动屏上终端（临时挂起桌面进程，HOME 退出后自动恢复）：
+桌面进入应用页（`c1pkg gui` / 我的应用），选 **terminal**：墨水屏变成终端，
+`HOME` 退出后桌面自己接回去。这条路径不需要挂起桌面进程——见下面「launcher
+集成契约」。
 
-   ```bash
-   ADB="adb -s <serial>" scripts/on-device-repl.sh
-   ```
+```bash
+ADB=adb scripts/c1term-launcher-app.sh --launch   # 同样走 c1pkg launch，可从 adb 触发
+ADB=adb scripts/c1term-launcher-app.sh --remove   # 撤掉这个应用
+```
 
-   手动起时，**启动与观察必须落在同一个 adb 会话内**：adbd 会回收立即退出
-   会话的子进程，`setsid ... &` 后单独结束会话会让 c1term 起来又消失。
+终端里可用的命令：
 
-   ```bash
-   "$ADB" shell "setsid /usr/data/c1term/c1term-run.sh </dev/null >/tmp/c1term.log 2>&1 & sleep 4; pidof c1term"
-   ```
+| 命令 | 作用 |
+|---|---|
+| `qzjs` | JS REPL（逐行求值，变量在会话内保持；`Ctrl-D` 退出） |
+| `c1wifi` | 当前连接 / IP / 网关 / DNS |
+| `c1wifi scan` | 扫描热点（射频关着时会先加载 atbm603x 模块，约数秒） |
+| `c1wifi join <ssid> <psk>` | 连接并保存（开放网络省略 psk） |
+| `c1wifi forget <ssid>` / `c1wifi off` | 删除已存网络 / 关掉射频 |
 
-2. 屏幕出现 `c1slim#` 后输入 `qzjs`（`/usr/data/c1term/bin` 已入 PATH）；
-3. 逐行输入 JS 求值（变量在同一会话内保持），`Ctrl-D` 退出 REPL，`HOME` 退出终端。
+### 从 adb 启动（调试用）
+
+```bash
+ADB="adb -s <serial>" scripts/on-device-repl.sh
+```
+
+这条路用 SIGSTOP 挂起桌面进程，**启动与观察必须落在同一个 adb 会话内**：
+adbd 会回收立即退出会话的子进程，`setsid ... &` 后单独结束会话会让 c1term
+起来又消失。手动起时：
+
+```bash
+"$ADB" shell "setsid /usr/data/c1term/c1term-run.sh </dev/null >/tmp/c1term.log 2>&1 & sleep 4; pidof c1term"
+```
+
+两条路别同时开：终端实例会抢 `/dev/input`，launcher 里的入口已做重复启动拦截。
+开机自启是可选项，默认**没有**装（`scripts/c1term-autostart.sh --enable` 才装，
+`--disable` 用可写分区的 flag 关掉）。
 
 卡住时执行 `"$ADB" shell /usr/data/c1term/c1term-stop.sh` 恢复桌面。
 
@@ -78,11 +104,39 @@ ADB=adb scripts/deploy-device.sh        # 或 ADB=/mnt/c/.../adb.exe 走 Windows
 > ISOLATED 进程模型下 `qzjs` 会自动 fork 同目录的 `qzjs-rt`（经
 > `/proc/self/exe` 解析），两个文件必须放在一起。
 
+## launcher 集成契约（实测逆向结论）
+
+C1ancher 自己不维护应用表：桌面应用页就是 `c1pkg gui`，它扫
+`/storage/c1/apps/*/current` 并用 `c1pkg launch <id>` 启动。要让一个应用出现在
+那里，需要满足两条 c1pkg 的隐式规则：
+
+1. **权限即信任**：从 `/storage/c1/apps/<id>` 一路到 `versions/<ver>` 的每个目录
+   都不能被 group/other 写（厂商为目录 0555、文件 0444）。世界可写的目录会被拒，
+   报 `installed entry metadata is unavailable` ——这是信任校验，不是缺台账。
+2. **交接靠锁**：`<ver>/.c1pkg-entry` 写入口文件名（无换行），`<ver>/.c1pkg-mode`
+   写 `direct`。`c1pkg launch` 会 flock `/dev/shm/c1ancher-external-app.{lock,runlock}`
+   并把 `direct` 写进 `.mode`，C1ancher 拿不到锁就不再碰 `/dev/epaper_lcd`；它全程
+   处于 `S`（不是 SIGSTOP），退出后自动接回屏幕。不写 `.c1pkg-mode` 时默认
+   `terminal` 模式，不适合自己抢屏的 C1Terminal。
+
+包目录是只读的，所以里面只放一个转 exec 的薄壳，真身留在
+`/usr/data/c1term/`，升级不用再动应用表。
+
+限制：不在厂商签名索引里的应用，标题只能用 id（小写）；想要正式名称
+"Terminal" 得进签名仓库（`/usr/data/c1/pkg/repository.{url,ed25519.pub}`，
+索引格式 `C1PKG-INDEX 2`，缓存 `verified.v1` = 64B 签名 + 索引原文）——换掉信任锚
+会废掉厂商应用商店，所以没做。
+
 ## 已知限制（移植笔记）
 
 - **无 HTTPS / WebAssembly**：minimal 档位关闭了 mbedTLS TLS 与 WAMR；
   `fetch` 仅 http。需要时在 `build-mips.sh` 追加
   `-DQZ_WITH_TLS=ON` / `-DQZ_WITH_WAMR=ON`（WAMR 的 MIPS 目标尚未验证）。
+- **配网的成功分支未跑过**：`c1wifi scan` / `join` 的新增-保存-删除-失败路径都是
+  实测的（厂商已存的 3 个网络在操作前后数量不变），但设备周围没有我方持有凭据的
+  AP，所以 `wpa_state=COMPLETED` 与拿到 DHCP 租约这条成功路径只按脚本逻辑推定。
+  生效配置是 `/usr/resource/wpa_supplicant.conf`（`wifi_up.sh` 真正读的那个），
+  不是桌面自己那份 `/usr/data/c1/wifi/wpa_supplicant.conf`。
 - **REPL 不支持顶层 `await`**：qzjs 的 eval 通道按 classic script 求值；
   交互中用 `.then(...)` 或 `(async()=>{...})()`。
 - **`fs` 不是全局**：WinterTC 模块表中列出的 `fs` 未以全局形式暴露（上游行为）。
