@@ -248,9 +248,13 @@ console.log('PERMS=' + JSON.stringify(api.perms));
 ui.rpc('sys.info', {}).then(function (r) {
   console.log('INFO ALLOWED ' + (r && r.service ? r.service : '?'));
 }, function () { console.log('INFO DENIED'); });
-ui.rpc('sys.storage', {}).then(function () {
+/* 探一个**已注册但需要 storage 能力**的方法。原先探的是 'sys.storage'，
+ * 那个方法并不在注册表内——于是被拒的理由是「服务不存在」而不是「能力不足」，
+ * 判据因此变弱：实现只要「凡是 storage 相关就拒」就能过，哪怕授权完全坏了。
+ * 探一个真实存在的方法，才能验出「同一应用、只差一个能力」的边界。 */
+ui.rpc('sys.storage.statfs', {}).then(function () {
   console.log('STORAGE ALLOWED');
-}, function () { console.log('STORAGE DENIED'); });
+}, function (e) { console.log('STORAGE DENIED ' + JSON.stringify(e.message || e)); });
 EOF
 
 # QZ_JS_DIR 指到 $JS2（只有 pkg 一个内置应用），所以焦点在第 1 行，enter 即中。
@@ -275,9 +279,9 @@ info_den_n=$(grep -c "INFO DENIED" "$perm_log" 2>/dev/null || true)
 # 这里判的是「授权判定的结果」，判定点在 C 侧，所以读它的回执是效果层面；
 # 画面层面由上面几条（坏包不执行、导航、帧可复现）覆盖。
 if [ "${leaked_n:-0}" -gt 0 ]; then
-  bad "未声明的 sys.storage 被放行（C 侧方法名边界没生效）"
+  bad "未声明 storage 能力却调通了 sys.storage.statfs（C 侧能力边界没生效）"
 elif [ "${denied_n:-0}" -gt 0 ] && [ "${info_ok_n:-0}" -gt 0 ]; then
-  ok "C 侧方法名边界生效：sys.info 放行、sys.storage 被拒（同一应用，只差 perms）"
+  ok "能力边界生效：同一应用，sys.info 放行、sys.storage.statfs 被拒（只差一个能力）"
 elif [ "${denied_n:-0}" -gt 0 ] && [ "${info_den_n:-0}" -gt 0 ]; then
   bad "sys.info 也被拒了（perms 已声明 info）——能力匹配写错，会把所有调用都堵死"
 elif [ "${denied_n:-0}" -gt 0 ]; then

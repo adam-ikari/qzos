@@ -120,6 +120,26 @@ panel        设备 I/O         唯一知道硬件细节的一层
 ADB="adb -s <serial>" scripts/probe-power-owner.sh
 ```
 
+## 系统服务面：JS 碰 C 的唯一通道
+
+`os/src/services.c` 的注册表 `s_registered[]` 就是 **C 能力的完整清单**。
+JS（shell 与应用）碰到宿主 C 代码只有这一条路；UI 桥（`bridge.c`）是纯渲染命令
+通道，不承载能力。授权检查落在服务面侧，不在渲染桥——挂在渲染通道上只挡住了
+那一条，而 JS 还能走别的路。
+
+```c
+{ "sys.info",              NULL,      sys_info_handler },
+{ "sys.storage.statfs",    "storage", sys_storage_statfs_handler },
+```
+
+两条规则：
+
+- **方法必须落在自己能力的命名空间下**（`sys.storage.*` 需要 `storage`）。启动时
+  `verify_registry()` 查一次，测试里再查一次——cap 配错方法名会让授权形同虚设。
+- **能力是注册表显式声明的**，不靠「以 `sys.` 开头就算」的前缀匹配。前缀式匹配
+  等于「`sys.` 下任何方法名都可达」，而实际 handler 只有一个——那是给未来留了
+  一扇没锁的门。
+
 ## 授权面（app package）
 
 `os/js/apkg.js` 做 manifest 校验与信任判定，`os/js/sandbox.js` 在**加载任何应用
@@ -190,6 +210,7 @@ bash scripts/verify-all.sh
 | `scripts/test-display.sh` | 显示纯逻辑：条带寻址、掩码移位、边界裁剪、脏区对齐、刷新决策（133 断言） | 否 / 否 |
 | `scripts/test-keymap.sh` | evdev 键码映射（82 断言，键码常量取自 `<linux/input.h>`） | 否 / 否 |
 | `scripts/test-power.sh` | 电源域决策层（43 断言）。场景矩阵，重点是**归属未知时全拒** | 否 / 否 |
+| `scripts/test-services.sh` | 系统服务注册表（30 断言）。**JS→C 唯一边界的可验证形态** | 部分 |
 | `scripts/test-apkg.sh` | 应用包校验 + 授权遮蔽（82 断言）。**跑在真实 qzjs 上**：核心断言是「`__native__` 那 57 个原生真被遮住了」，在 node 上跑等于什么都没测 | 原生 qzjs / 否 |
 | `os/test/test_shell_apps.sh` | 应用模型端到端：坏 manifest 被列出来但拒绝启动，**判据是画面像素** | 是 / 否 |
 | `os/test/verify-rt-recovery.sh` | JS 引擎崩溃恢复：杀 `qzjs-rt`，断言屏上出现提示、rt 被重建、桌面逐字节复现、开机失败也留在退避循环 | 是 / 否 |

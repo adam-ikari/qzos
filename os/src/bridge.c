@@ -48,40 +48,14 @@ static qz_t *s_rt;
 
 enum { SUB_CLICK = 1, SUB_VALUE = 2 };
 
-/* ---- 当前应用授权上下文（brain: qzos-app-package） ----
+/* 授权上下文**不存这里**。
  *
- * shell 在 launch 前发 op:app 告知「现在跑的是哪个应用、授了什么能力」，
- * back 时发 perms=[] 清空。op_rpc 逐次比对，**缺省为空**——没发过 op:app 的
- * 调用一律按无授权处理。
- *
- * 为什么检查点必须在 C 侧而不能放 JS：应用和 shell 共享同一个 QuickJS 上下文，
- * 应用可以改写 shell 自己的 ui.rpc，所以「在 JS 里比对一次方法名」能被应用
- * 自己撤销。JS 侧那层遮蔽（sandbox.js）管的是 fs / __native__ 全局对象面，
- * 两者分工互补，缺一不可。 */
+ * 早期它住在 bridge.c 的一个静态结构里，由 op_rpc 逐次比对。那是历史偶然：
+ * 当时只有 sys.info 一个方法，op_rpc 顺手就检查了；后来加了能力才暴露出那个
+ * 位置不对——渲染桥是纯命令通道，在架构上不该承载能力。现在上下文归
+ * services.c（唯一的能力边界），op:app 只负责把 perms 转交过去。
+ */
 #define MAX_CAPS 8
-static struct {
-    char id[48];
-    char caps[MAX_CAPS][16];
-    int n_caps;
-    bool active;
-} s_app;
-
-/* 能力 X 授予 sys.X 与 sys.X.*；不在 sys. 下的方法应用永远调不到。
- * 与 os/js/apkg.js 的 allows() 是同一规则的 C 侧实现。 */
-static bool app_allows(const char *method)
-{
-    if (!s_app.active || !method) return false;
-    if (strncmp(method, "sys.", 4) != 0) return false;
-    const char *cap = method + 4;
-    size_t caplen = strcspn(cap, ".");
-    if (caplen == 0 || caplen >= 16) return false;
-    for (int i = 0; i < s_app.n_caps; i++) {
-        if (strlen(s_app.caps[i]) == caplen &&
-            memcmp(s_app.caps[i], cap, caplen) == 0)
-            return true;
-    }
-    return false;
-}
 
 void qzos_bridge_set_rt(qz_t *rt)
 {
@@ -386,18 +360,15 @@ static void rpc_done(int ok, const char *result, size_t len, void *u)
     free(rid);
 }
 
-/* op:app — 声明/清空当前应用授权。只接受已在能力表内的能力；表外的**不静默
- * 忽略**而是整条拒绝（回一个 error），因为忽略会让应用带着残缺授权在系统里
- * 跑而作者不知情。 */
-static const char *const s_known_caps[] = {"info", "storage", "settings", "net", "power"};
-
+/* op:app — 声明/清空当前应用授权。**只是转交**给服务面：本文件不判定、
+ * 也不保存状态。表外能力由 qzos_services_set_app_perms 整条拒绝。 */
 static void op_app(cJSON *j)
 {
     cJSON *jid = cJSON_GetObjectItem(j, "id");
     const char *id = cJSON_IsString(jid) ? jid->valuestring : NULL;
     cJSON *perms = cJSON_GetObjectItem(j, "perms");
-    int n = 0;
     char caps[MAX_CAPS][16];
+    int n = 0;
 
     if (!perms || !cJSON_IsArray(perms)) {
         qzos_bridge_sendf("{\"evt\":\"error\",\"msg\":\"op:app needs perms array\"}");
@@ -405,29 +376,17 @@ static void op_app(cJSON *j)
     }
     cJSON *it;
     cJSON_ArrayForEach(it, perms) {
+        if (n >= MAX_CAPS) break;
         if (!cJSON_IsString(it)) continue;
-        bool known = false;
-        for (size_t k = 0; k < sizeof(s_known_caps) / sizeof(s_known_caps[0]); k++) {
-            if (strcmp(it->valuestring, s_known_caps[k]) == 0) { known = true; break; }
-        }
-        if (!known) {
-            /* 整条拒绝：宁可这次 launch 失败，也不要半授权。 */
-            memset(&s_app, 0, sizeof(s_app));
-            qzos_bridge_sendf("{\"evt\":\"error\",\"msg\":\"op:app unknown cap: %s\"}",
-                              it->valuestring);
-            return;
-        }
-        if (n < MAX_CAPS && strlen(it->valuestring) < 16) {
-            snprintf(caps[n], sizeof(caps[0]), "%s", it->valuestring);
-            n++;
-        }
+        if (strlen(it->valuestring) >= sizeof(caps[0])) continue;
+        snprintf(caps[n], sizeof(caps[0]), "%s", it->valuestring);
+        n++;
     }
 
-    memset(&s_app, 0, sizeof(s_app));
-    for (int i = 0; i < n; i++) memcpy(s_app.caps[i], caps[i], sizeof(caps[0]));
-    s_app.n_caps = n;
-    s_app.active = (id != NULL);
-    if (id) snprintf(s_app.id, sizeof(s_app.id), "%s", id);
+    if (!qzos_services_set_app_perms(id, caps, n)) {
+        /* 表外能力：整条拒绝。宁可这次 launch 失败，也不要半授权。 */
+        qzos_bridge_sendf("{\"evt\":\"error\",\"msg\":\"op:app: unknown capability\"}");
+    }
 }
 
 static void op_rpc(cJSON *j)
@@ -439,23 +398,13 @@ static void op_rpc(cJSON *j)
     cJSON *params = cJSON_GetObjectItem(j, "params");
     char *pstr = params ? cJSON_PrintUnformatted(params) : NULL;
 
-    /* 方法名边界：能力不足就地拒绝，**不进服务面**。回的是 ok:false，
-     * 所以 JS 侧的 promise 会 reject —— 这是「被拒绝」的正常回执，
-     * 与「调用了不存在的 op 导致永不回执」是两回事（后者是 bug，见下）。 */
-    if (!app_allows(method)) {
-        int *ridp = malloc(sizeof(int));
-        if (ridp) {
-            *ridp = id;
-            char err[160];
-            int n = snprintf(err, sizeof(err),
-                             "{\"error\":\"permission denied\",\"method\":\"%s\"}",
-                             method);
-            rpc_done(0, err, (size_t)n, ridp);
-        }
-        if (pstr) free(pstr);
-        return;
-    }
-
+    /* 转发到系统服务面。**这里不做授权检查**。
+     *
+     * 授权检查已移到 services.c（brain: qzos-service-boundary）：JS 碰 C 只有
+     * 服务面一条路，所以检查必须在那条路上。留在渲染桥的问题是——它只挡住了
+     * 这一条通道，而「渲染桥」本身是纯命令通道、在架构上不该承载能力。
+     *
+     * 这一层现在只做一件事：把 JSON 变成服务面的方法调用。 */
     int *ridp = malloc(sizeof(int));
     if (ridp) {
         *ridp = id;

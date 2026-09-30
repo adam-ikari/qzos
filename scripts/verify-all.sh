@@ -24,6 +24,9 @@ bash scripts/test-keymap.sh
 step "power domain decision layer (pure, no device)"
 bash scripts/test-power.sh
 
+step "system-service registry (the only JS->C boundary)"
+bash scripts/test-services.sh
+
 step "app package + sandbox unit tests (real qzjs, no device)"
 bash scripts/test-apkg.sh
 

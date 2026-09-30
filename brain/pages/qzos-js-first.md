@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [layering, js, c99, architecture, services]
 created: "2026-09-30T04:31:11"
-updated: "2026-09-30T04:51:17"
+updated: "2026-09-30T14:55:11"
 ---
 
 <!-- compiled_truth -->
@@ -94,3 +94,9 @@ updated: "2026-09-30T04:51:17"
   summary: "收窄「JS 侧检查等于没放」这条过强判断：只对应用持有引用的检查成立；闭包捕获真身的遮蔽是有效的，所以授权主体从 C 移到 JS。同时删掉「qzjs.fs 无路径限制=结构性无解」的成本条目——实为可注入遮蔽的缺口"
   source: "brain update-truth + 探针实测"
   affects: [qzos-js-first, qzos-app-package]
+
+- time: 2026-09-30T14:55:11
+  kind: reversal
+  summary: "翻正「服务面 JS 优先、C 兜底」这条措辞：它暗示 C 原语层可被任意 JS 服务触达，等于在授权检查之外开后门。正确表述是——JS 优先说的是**语言选择**（策略与组合写 JS，syscall/必须待在应用上下文之外的东西写 C），而**边界形状**由 qzos-service-boundary 定：JS 到 C 只有 uvrpc 服务面一条路，注册表即 C 能力完整清单"
+  source: brain append-timeline
+  affects: [qzos-js-first, qzos-service-boundary]

@@ -34,6 +34,19 @@ int qzos_services_init(struct uv_loop_s *loop);
 void qzos_services_rpc(const char *method, const char *params_json,
                        qzos_rpc_done_t done, void *u);
 const char *qzos_services_addr(void);
+/* 授权上下文（brain: qzos-service-boundary）。服务面是 JS→C 的唯一通道，
+ * 所以检查与状态都在这里；渲染桥只负责转交 op:app。缺省为空 = 全拒。 */
+bool qzos_services_set_app_perms(const char *id, char caps[][16], int n);
+int  qzos_services_app_caps(char out[][16], int max);
+/* 注册表里 C 能力方法的总数（闸门用它核对「注册表之外无 C 能力」）*/
+int  qzos_services_method_count(void);
+/* 某方法是否在注册表内（gate 用它穷举校验）*/
+bool qzos_services_has_method(const char *method);
+/* 某方法需要的能力；NULL = 无需授权。NULL 且非 NULL method 表示未知方法。*/
+const char *qzos_services_method_cap(const char *method);
+/* 授权判定的可观测钩子（不执行调用，只回答「会不会被放行」）。
+ * default-deny 的直接判据：没设授权时，带能力的方法一律 false。 */
+bool qzos_services_would_allow(const char *method);
 
 /* ---- bridge: JSON UI protocol JS <-> LVGL (bridge.c) ---- */
 struct qz_t; /* qz_t */
