@@ -5,7 +5,7 @@ category: project
 status: active
 tags: [verification, device, perf]
 created: "2026-09-29T00:51:32"
-updated: "2026-09-30T03:13:51"
+updated: "2026-09-30T03:36:12"
 ---
 
 <!-- compiled_truth -->
@@ -25,30 +25,38 @@ updated: "2026-09-30T03:13:51"
 | `-e` 端到端启动 | ~60–70 ms（中位） |
 | RSS：宿主 `qzjs` | 816 KB |
 | RSS：主 RT `qzjs-rt` | 3.1 MB |
-| 二进制（strip 后） | 各 ~2.9 MB |
+| 二进制（strip 后） | qzjs / qzjs-rt 各 ~2.9 MB；`qzos-host` ~4.3 MB |
 
-50 MiB 内存余量充足。`qzjs-rt` 经 Zig 交叉编译，MIPS `qzos-host` 约 4.3 MB。
+50 MiB 内存余量充足。
 
 ## qzos 宿主的自动化验证（无头、无设备）
 
-`/dev/epaper_lcd` 只写不可读，真机画面远程抓不到——所以正确性靠自动化通道守，视觉才留给人眼。四条都能在开发机上跑：
+`/dev/epaper_lcd` 只写不可读，真机画面远程抓不到——所以正确性靠自动化通道守，视觉才留给人眼。`scripts/verify-all.sh` 是统一入口，从纯逻辑单测到端到端场景分层跑：
 
 | 通道 | 覆盖 | 基线 |
 |---|---|---|
-| `scripts/test-display.sh` | 显示纯逻辑（条带寻址/阈值/脏区/刷新决策） | 133 断言 0 失败 |
-| `scripts/verify-frames.sh` | 原生 vs MIPS **帧逐字节一致** | 5635 字节完全相同 |
-| `scripts/verify-input.sh` | 键盘全链路（evdev→LVGL→shell） | 3 场景 2/2 |
-| `scripts/qemu-verify.sh` | qzjs 自身（version/eval/REPL/crypto/async/fetch） | 8/8 |
+| `test-display.sh` | 显示纯逻辑（条带寻址/阈值/脏区/刷新决策） | 133 断言 0 失败 |
+| `test-keymap.sh` | 键码映射（取自内核头 `linux/input.h`） | 82 断言 0 失败 |
+| `verify-input.sh` | 键盘全链路（evdev→LVGL→shell）+ e-ink 刷新预算 | 7 项断言全过 |
+| `verify-frames.sh` | 原生 vs MIPS **帧逐字节一致** | 5635 字节完全相同 |
+| `qemu-verify.sh` | qzjs 自身（version/eval/REPL/crypto/async/fetch） | 8/8 |
 
 - MIPS 侧经 `qemu-mipsel-static` 跑；ISOLATED 双进程需要 rt trampoline（见 [[qemu-isolated-trampoline]]）。
 - 键盘回放：把 `QZ_INPUT0` 指向 FIFO，`os/test/replay-keys.py` 按真实 `struct input_event` 布局写入，宿主照常走 `uv_poll`。
-- **布局陷阱**：`struct input_event` 的大小随架构不同（x86_64 = 24，mips32 = 16，差在 timeval 里 time_t 的宽度）。喂错布局会被静默切成垃圾事件，所以 `--arch` 必须显式声明**消费者**的架构，不能靠"反正都在同一台机器上跑"蒙混。
-- 场景断言语义而非黄金文件：关键那条是 **roundtrip**——进应用再退回来必须逐字节复现桌面帧（e-ink 每帧内容应是状态的纯函数），且前后两次是独立运行，不是自证。
+- **布局陷阱**：`struct input_event` 的大小随架构不同（x86_64 = 24，mips32 = 16，差在 timeval 里 time_t 的宽度）。喂错布局会被静默切成垃圾事件，所以 `--arch` 必须显式声明**消费者**的架构。
+- 场景断言语义而非黄金文件；关键那条是 **lifecycle**——进应用再退回来必须逐字节复现桌面帧（e-ink 每帧内容应是状态的纯函数），且前后两次是独立运行，不是自证。
+
+### 验证纪律（这部分比任何单条断言都重要）
+
+- **断言要问"这个键/操作*该*产生什么不同"，不是"有没有变化"。** 曾有一条 launch 断言在方向键完全是空操作时照样通过——空操作让 enter 启动的始终是第一个应用，而"帧变了"依然成立。这类"看起来在测、其实什么都没测"的断言比没有断言更危险。
+- **每条新断言都要做变异测试**：把对应 bug 塞回代码，确认它会红。否则无法区分"闸门"和"装饰"。已验证：去掉方向键适配 → nav+typing 挂；打开光标闪烁 → 刷新预算超限挂；还原实参求值顺序陷阱 → typing 挂。
+- **单测不能和被测代码抄同一张表。** 键码测试的常量取自内核头、只有期望字符是字面量，否则映射抄错时测试和代码一起错，永远测不出来。
+- **覆盖的顺序按"定位成本"从低到高**：纯逻辑单测（毫秒）→ 端到端场景（秒）→ 真机（不可自动化）。上层现象不对时，先确认下层闸门是绿的，否则容易在上层猜方向。
 
 ## 仍缺的真机验证（不能被上面这些替代）
 
 - `/dev/epaper_lcd` 的**实际落屏**：波形选择是否被驱动接受、刷屏耗时、残影表现。
-- evdev **真实键码**与真机矩阵键盘行为（当前键码表抄自 C1Terminal `keyboard.go`，回放用的是同一张表——等于自证，真机才能证伪）。
+- evdev **真实键码**与真机矩阵键盘行为（当前键码表以 `linux/input.h` 为准并与 C1Terminal `keyboard.go` 对齐，但真机矩阵映射仍需实按一遍确认）。
 - 墨水屏刷新期间的输入响应（面板阻塞时按键是否丢）。
 - 视觉本身：字体渲染、布局、CJK 断行，只能人眼在屏上看。
 
@@ -109,6 +117,12 @@ updated: "2026-09-30T03:13:51"
   affects: [port-verification]
 
 - time: 2026-09-30T03:13:51
+  kind: decision
+  summary: Rewrote compiled_truth to the new best understanding
+  source: brain update-truth
+  affects: [port-verification]
+
+- time: 2026-09-30T03:36:12
   kind: decision
   summary: Rewrote compiled_truth to the new best understanding
   source: brain update-truth
