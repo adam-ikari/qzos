@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [ui lvgl architecture bridge]
 created: "2026-09-29T21:19:37"
-updated: "2026-09-30T02:56:14"
+updated: "2026-09-30T03:12:47"
 ---
 
 <!-- compiled_truth -->
@@ -132,3 +132,9 @@ graph TB
   summary: Rewrote compiled_truth to the new best understanding
   source: brain update-truth
   affects: [qzos-ui-architecture]
+
+- time: 2026-09-30T03:12:47
+  kind: decision
+  summary: "键盘通路曾整体失效：lv_init() 会把已注册的 lv_tick_set_cb 回调清成 NULL（实测 lv_tick_get_cb 由非 NULL 变 NULL），本进程无人调 lv_tick_inc，于是 lv_tick_get() 恒 0，lv_timer_handler 认定所有定时器未到期，indev 读取定时器永不触发，evdev 按键堆在队列里静默丢失。之所以长期未被发现：绘制有旁路（bridge 的 refresh op 显式调 lv_refr_now），画面一直是对的，正好盖住坏掉的定时器子系统。教训：**一条链路上部分模块有旁路、另一部分没有时，没被盖住的那部分可能整条是死的而看不出来**——必须有逐跳追踪 + 端到端场景断言。同时修掉 e-ink「无变化就完全不刷」未真正生效（changed==0 仍提交）：改为清空脏区让策略按契约决策，显式全刷请求仍照常生效（清残影是面板的事）。新增 scripts/verify-input.sh + os/test/replay-keys.py：QZ_INPUT0 接 FIFO 按真实 struct input_event 布局回放，场景断言语义（boot/launch/roundtrip，roundtrip 要求逐字节复现桌面帧）而非黄金文件；布局大小随架构不同（x86_64=24 / mips32=16，差在 timeval 的 time_t），--arch 必须显式声明消费者架构。"
+  source: "MIPS 构建打通后做输入通路排查（提交 d98d251）"
+  affects: [qzos-ui-architecture, zig-musl-cross-build]
