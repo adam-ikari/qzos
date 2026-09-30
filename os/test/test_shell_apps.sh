@@ -140,7 +140,25 @@ else
   bad "桌面帧不可复现（同一状态两次跑出不同画面）"
 fi
 
-# ---- 5. 装面之后系统自己没被误伤：正常应用仍列在桌面上 ----
+# ---- 5. 坏包详情页必须退得出来（back / home 都要能） ----
+# 这条是被上一个 bug 逼出来的：back() 开头是 `if (!ctx) return`，而坏包详情页
+# 恰恰是「ctx 为空」的状态——于是详情页上的 back 按钮和系统 back 键全都没反应，
+# 用户被卡住，只能重启。当时 82 条单测 + 5 条端到端全绿：单测测不到 shell 的
+# 键路由，端到端只测了「进得去详情页」没测「出得来」。
+#
+# 判据：桌面有应用按钮的上边框（y=30 那一行 280px 连续墨），详情页没有。
+BTN_TOP="8,30,280,1"
+
+for keyname in back home; do
+  run_desk "$OUT/apps" "nav_$keyname" "down,down,enter,$keyname"
+  if [ "$(ink_at "$OUT/nav_$keyname.pbm" "$BTN_TOP")" -gt 200 ]; then
+    ok "从坏包详情页按 $keyname 能退回桌面（应用按钮行恢复）"
+  else
+    bad "从坏包详情页按 $keyname 退不回桌面——用户被卡住，只能重启"
+  fi
+done
+
+# ---- 6. 装面之后系统自己没被误伤：正常应用仍列在桌面上 ----
 # 判据是应用行区域有墨（Hello / Notepad 两个按钮），不是全局墨量：桌面空屏和
 # 「有按钮但没字」都能骗过全局阈值。
 btn_ink=$($VIEW --region "$OUT/desk.pbm" --at 8,41,280,16 --at 8,66,280,12 \
@@ -151,11 +169,92 @@ else
   bad "装面后桌面异常空（应用行墨量 ${btn_ink}）——面把系统自己砍了"
 fi
 
-# ---- 6. 给人留一张能直接看的图 ----
+# ---- 7. 已在桌面时按 back 不该引发重绘（e-ink 寿命） ----
+# 修了 back() 之后，「已在桌面」也得有判据，否则每次按 back 都重画一次桌面
+# = 每次按 back 白刷一次墨水屏。
+#
+# 判据用**提交次数**而不是帧内容：帧是状态的纯函数，重绘出一模一样的帧在内容
+# 上分不出来，但驱动已经刷过一次波形了——那正是要避免的浪费。
+# （第一版误用 cmp 比帧，两个 run 的按键时序不同导致假失败。）
+commits() { grep -c "qzos-display: commit" "$1" 2>/dev/null || true; }
+run_desk "$OUT/apps" nav_stay "back"
+stay_n=$(commits "$OUT/nav_stay.log")
+if [ "${stay_n:-99}" -le 1 ]; then
+  ok "桌面态按 back 不重绘（提交 ${stay_n} 次，只有启动那一帧）"
+else
+  bad "桌面态按 back 引发重绘（提交 ${stay_n} 次，白耗墨水屏波形）"
+fi
+
+# ---- 8. 给人留一张能直接看的图 ----
 $VIEW "$OUT/desk.pbm" "$OUT/desk.png" --scale 3 >/dev/null
 $VIEW "$OUT/ctl.pbm"  "$OUT/ctl.png"  --scale 3 >/dev/null
 cp "$OUT/desk.png" "$OUT/ctl.png" /tmp/opencode/ 2>/dev/null || true
 echo "  ..  目检图: /tmp/opencode/desk.png（坏包场景） /tmp/opencode/ctl.png（正对照）"
+
+# ---- 9. C 侧方法名边界：能力不足必须被拒（不能只靠 JS 那层遮蔽） ----
+# 遮蔽面（sandbox.js）在 JS 侧，管 fs / __native__。方法名边界在 C 侧
+# （bridge.c 的 op_rpc + app_allows），因为应用能改写 shell 自己的 ui.rpc。
+# 所以这一条必须打到宿主：调一个没声明的能力，宿主要回 ok:false。
+#
+# fixture 放在**内置**目录（JS_DIR/apps）而不是用户目录——这是必须的：
+# 用户目录 statMode 恒 null → fail-closed → perms 恒被清空，拿不到任何能力，
+# 那样测的就不是「C 侧按 perms 放行」，而是「全被拒」。
+# 而内置目录的可信性来自「随仓发布」，这正是本条要测的路径。
+JS2="$OUT/js2"
+mkdir -p "$JS2/apps/pkg"
+for f in ui.js apkg.js sandbox.js shell.js; do ln -s "$PWD/os/js/$f" "$JS2/$f"; done
+cat > "$JS2/apps/pkg/app.json" <<'EOF'
+{ "schema": 1, "id": "pkg", "name": "Perm Probe", "version": "1.0.0",
+  "api": 1, "entry": "app.js", "perms": ["info"] }
+EOF
+cat > "$JS2/apps/pkg/app.js" <<'EOF'
+/* 判据走 console.log 而不是画面：pbm_view 不做 OCR，测不出「画的是哪个字」，
+ * 而这里要判的正是「哪个方法被放行」。画面层面的覆盖在别处（坏包不执行、
+ * 导航、帧可复现），这里专打 C 侧的方法名边界。
+ *
+ * 两个调用必须**同时**发出：宿主只认「此刻的活动应用」，串行等第一个的结果
+ * 再发第二个，中间插入的其它消息会改掉上下文。 */
+console.log('PERMS=' + JSON.stringify(api.perms));
+ui.rpc('sys.info', {}).then(function (r) {
+  console.log('INFO ALLOWED ' + (r && r.service ? r.service : '?'));
+}, function () { console.log('INFO DENIED'); });
+ui.rpc('sys.storage', {}).then(function () {
+  console.log('STORAGE ALLOWED');
+}, function () { console.log('STORAGE DENIED'); });
+EOF
+
+# QZ_JS_DIR 指到 $JS2（只有 pkg 一个内置应用），所以焦点在第 1 行，enter 即中。
+perm_frame="$OUT/perm.pbm"
+perm_log="$OUT/perm.log"
+F="$OUT/perm.fifo"; mkfifo "$F"
+( QZ_DISPLAY=pbm QZ_PBM="$perm_frame" QZ_RPC_SOCK=none QZ_JS_DIR="$JS2" \
+  QZ_APP_DIR="$OUT/empty" QZ_AUTOEXIT_S=9 QZ_INPUT0="$F" QZ_INPUT1= \
+  "$HOST" >"$perm_log" 2>&1 ) &
+PP=$!
+sleep 2.5
+python3 "$REPLAY" --arch x86_64 --script enter --out "$F"
+wait "$PP" || true
+
+denied_n=$(grep -c "STORAGE DENIED" "$perm_log" 2>/dev/null || true)
+leaked_n=$(grep -c "STORAGE ALLOWED" "$perm_log" 2>/dev/null || true)
+info_ok_n=$(grep -c "INFO ALLOWED" "$perm_log" 2>/dev/null || true)
+info_den_n=$(grep -c "INFO DENIED" "$perm_log" 2>/dev/null || true)
+
+# 判据读 stderr 里的 console.log：应用把结果**画出来**还要等一次渲染往返，
+# 而像素判据在这里测不出「画的是哪个字」——那正是 pbm_view 不做 OCR 的局限。
+# 这里判的是「授权判定的结果」，判定点在 C 侧，所以读它的回执是效果层面；
+# 画面层面由上面几条（坏包不执行、导航、帧可复现）覆盖。
+if [ "${leaked_n:-0}" -gt 0 ]; then
+  bad "未声明的 sys.storage 被放行（C 侧方法名边界没生效）"
+elif [ "${denied_n:-0}" -gt 0 ] && [ "${info_ok_n:-0}" -gt 0 ]; then
+  ok "C 侧方法名边界生效：sys.info 放行、sys.storage 被拒（同一应用，只差 perms）"
+elif [ "${denied_n:-0}" -gt 0 ] && [ "${info_den_n:-0}" -gt 0 ]; then
+  bad "sys.info 也被拒了（perms 已声明 info）——能力匹配写错，会把所有调用都堵死"
+elif [ "${denied_n:-0}" -gt 0 ]; then
+  bad "storage 被拒但 info 没有任何回执：op:app 可能没送达宿主（perms 上下文为空 → 全拒）"
+else
+  bad "C 侧授权判定没跑起来：$(tail -3 "$perm_log" | tr '\n' ' ')"
+fi
 
 echo
 echo "  $pass passed, $fail failed"

@@ -5,25 +5,25 @@ category: decision
 status: active
 tags: [app, package, manifest, permission, security]
 created: "2026-09-30T04:25:10"
-updated: "2026-09-30T07:14:42"
+updated: "2026-09-30T08:56:15"
 ---
 
 <!-- compiled_truth -->
-## 决策：qzos 应用包结构 = manifest 契约 + 授权（JS 遮蔽为主、C 补方法名边界）
+## 决策：qzos 应用包结构 = manifest 契约 + 授权（JS 遮蔽 + C 方法名边界）
 
 **已实现**：`os/js/apkg.js`（校验/信任/能力）、`os/js/sandbox.js`（遮蔽）、
-`os/js/shell.js` 接入（launch 前装面、坏包列但不启动、`api.require`/`onExit`/`perms`）。
-闸门 82 断言（`scripts/test-apkg.sh`，跑在**真实 qzjs** 上）+ 5 项端到端
-（`os/test/test_shell_apps.sh`，判据是画面像素）。设计稿 `os/docs/app-package.md`。
+`os/js/shell.js` 接入、`os/src/bridge.c` 的 `op_app` + `app_allows`（C 侧边界）。
+闸门 82 单测断言（`scripts/test-apkg.sh`，跑**真实 qzjs**）+ 9 项端到端
+（`os/test/test_shell_apps.sh`）。设计稿 `os/docs/app-package.md`。
 
 ### 现状原本缺的五件事
 
 1. 无 `version`、无「应用要求哪一版宿主 UI 桥」→ 宿主改 op 语义后旧应用静默出错。
-2. **无任何授权**：`os/src/bridge.c` 的 `op_rpc` 拿任意 `method` 直接转发。
+2. **无任何授权**：`bridge.c` 的 `op_rpc` 拿任意 `method` 直接转发。
 3. 只能单文件：应用无法 require 兄弟文件。
 4. 生命周期靠 `globalThis.App` / `App_onExit` 全局约定，异常路径漏清。
-5. 不区分信任：`discoverApps()` 扫 world-writable 的 `/storage`。c1pkg 已踩透
-   同一类问题——**权限即信任**（[[c1ancher-app-integration]]）。
+5. 不区分信任：`discoverApps()` 扫 world-writable 的 `/storage`（c1pkg 已踩透
+   同一类问题——**权限即信任**，见 [[c1ancher-app-integration]]）。
 
 ### 包结构与 manifest
 
@@ -43,18 +43,17 @@ entry 不得逃逸、`api` 主版本 ≤ 宿主、perms 全在能力表、目录
 
 `perms` 填**能力**不是方法名；能力 `X` 授予 `sys.X` 与 `sys.X.*`。
 `info`/`storage`/`settings`/`net`/`power`，后两个等闸门 0（`power` 绝不默认授予）。
-不在 `sys.` 下的方法应用永远调不到。
+不在 `sys.` 下的方法应用永远调不到。宿主对**表外能力整条拒绝**（`op_app` 回 error），
+不静默忽略——忽略会让应用带着残缺授权在系统里跑而作者不知情。
 
-| 执行点 | 位置 | 挡什么 |
-| --- | --- | --- |
-| **JS** | launch 前装面 | fs / `__native__` 原生面 |
-| **C** | `bridge.c` 的 `op_rpc` | 越权方法名 |
+| 执行点 | 位置 | 挡什么 | 为什么在这层 |
+| --- | --- | --- | --- |
+| **JS** | `sandbox.js` launch 前装面 | fs / `__native__` 原生面 | 那些是 JS 全局对象，C 侧没有逐方法钩子 |
+| **C** | `bridge.c` 的 `op_rpc` + `app_allows` | 越权方法名 | 应用能改写 shell 自己的 `ui.rpc`，JS 侧的方法名检查能被它撤销 |
 
-C 那道只补方法名边界，因为**应用能改写 shell 自己的 `ui.rpc`**；遮蔽必须放 JS
-（`__native__` 是一次性挂上的一整对象，没有逐方法的宿主钩子）。
-宿主靠 `{"op":"app","id":…,"perms":[…]}` 知道当前应用，**缺省为空**。
+宿主靠 `{"op":"app","id":…,"perms":[…]}` 知道当前应用，**缺省为空**（没发过就全拒）。
 
-### 注入方案（实测校正后的定论）
+### 注入方案
 
 `globalThis.__native__` 暴露 **57 个原生**（qzjs `src/context.c:189` 把
 `__native_inject__` 删掉后以 `__native__` 重新挂上），含 `fsWrite`/`fsRemove`/
@@ -81,6 +80,29 @@ qzjs.fs           = fsFacade(realFs);
 - 原生面用**白名单**（default-deny），不是黑名单：黑名单漏一项就是敞开的口子，
   而漏项不会有人发现。
 
+### 信任规则：分两路，不是一刀切
+
+- **用户目录**（`/storage`）：`statMode` 原语还没实现（JS 侧没有 `stat`，
+  `qzjs.fs` 与 `__native__` 都没有，实测）→ **fail-closed，perms 恒清空**。
+  刻意的：静默当作可信等于给整个授权模型开后门。
+- **内置目录**（`JS_DIR/apps`，随仓发布、只读 rootfs）：**可信**，其可信性来自
+  「随仓发布」而不是目录权限位。
+
+一刀切 fail-closed 是**错的**，已翻正：它会让内置的 hello 拿不到
+`perms:["info"]`，其 `sys.info` 按钮静默失效——而 **11 项键盘端到端全绿**，
+因为那条断言只看「画面变了没」，不看画面上是不是错误信息。
+
+`dirTrusted` 的上界是 **apps-root**（有意）：本机 `/storage` 是 0777，若往上查到
+`/` 则任何用户应用都永远拿不到 perms，模型在真机上全废。
+
+### 通知类通道不能复用请求-应答通道
+
+`op:app` 是通知，宿主处理完**不回**任何东西。早期写成 `ui.rpc('app', …)`，结果是
+请求发出去后宿主找不到这个 method、**永不 settle**——`.catch()` 只处理 rejection，
+不处理「永不 settle」，所以那个 `.catch(function(){})` 完全是摆设；每次
+launch/back 各泄漏一个 `rpcPending` 条目。50 MiB 的设备上不能这么攒。
+现在走独立的 `ui.setApp()`（`{"op":"app",…}`）。
+
 ### 剩下的洞
 
 应用仍能读写 shell 的全局状态（同一 context）。**唯一结构性洞**。而
@@ -88,55 +110,40 @@ qzjs.fs           = fsFacade(realFs);
 shell 在 JS 层编排、不必改引擎**。遮蔽本身是合作式的：挡误用与写错的授权，不挡
 蓄意攻击同上下文。
 
-### 信任规则与当前的 fail-closed
-
-目录 group/other 可写 → **清空 perms 而非拒绝启动**（示例与随手写的应用不该被
-权限位藏起来；清空授权才是真正挡住误用的那步）。未知能力 → **拒绝启动整个应用**
-而非忽略（忽略会让应用带着残缺授权在系统里跑而作者不知情）。
-
-`dirTrusted` 的上界是 **apps-root**（有意）：本机 `/storage` 是 0777，若往上查到
-`/` 则任何用户应用都永远拿不到 perms，模型在真机上全废。代价是「能整体替换
-apps-root 的人」不受约束——那是「可以往设备装任意应用」的另一个问题。
-
-**当前 `statMode` 恒为 null**：JS 侧没有 `stat`（`qzjs.fs` 与 `__native__` 都没有，
-实测），所以 `dirTrusted` 一律 fail-closed → **用户应用的 perms 恒被清空**。
-这是有意的：静默当作可信等于给整个授权模型开后门。补 `statMode` 原语后自动变可信，
-`shell.js` 不需要改。
-
-### API
+### API 与生命周期
 
 `api` 取代全局约定：`dir` / `id` / `exit()` / `require(rel)`（归一化后须仍在
-`api.dir` 内，async）/ `perms`（`Object.freeze` 的只读副本，供 UI 隐藏做不到的
-按钮）/ `can(cap)` / `onExit(fn)`。旧 manifest 缺 `schema`/`id`/`version`/`api`
-一律拒绝启动并显示原因；缺 `perms` 变无授权（`hello` 已补 `["info"]`）。
-`back()` 顺序：**先收权再跑收尾钩子**（反过来等于给正在退出的应用多留授权窗口）。
-`launch()` 失败路径也必须收权 + 清面，否则残留授权会一直生效。
+`api.dir` 内，async）/ `perms`（`Object.freeze` 只读副本，供 UI 隐藏做不到的按钮）/
+`can(cap)` / `onExit(fn)`。`back()` 顺序：**先收权再跑收尾钩子**（反过来等于给
+正在退出的应用多留授权窗口）；`launch()` 失败路径同样收权 + 清面。
+
+`back()` 的「已在桌面」判据**不能**用 `ctx` 是否为空——坏包详情页正是 ctx 为空的
+状态，用 ctx 判会让详情页的 back 按钮与系统 back 键全失灵，用户被卡住只能重启。
+改用显式的 `s_on_detail`，并且已在桌面时按 back **不重绘**（e-ink 寿命）。
 
 ### 验证纪律
 
-断言必须落在结果上：default-deny 断言「拿到拒绝」；能力前缀同时测放行与仍被拒；
-世界可写目录里声明 `perms:["info"]` 的应用**必须调不到** `sys.info`。
+断言落在结果上：default-deny 断言「拿到拒绝」；能力前缀同时测放行与仍被拒；
 **遮蔽类必须连 `__native__` 一起断言**，否则「遮了门面没遮后门」会全绿。
 
 「坏包没执行」判**画面像素**而非日志（回执由 dispatch 无条件产出，与引擎有没有
-真拒绝无关——qzjs 的 interrupt 测试就这么全绿的）。用 `os/test/pbm_view.py`
-把 1bpp 帧渲成 PNG（最近邻；1bpp 上任何插值都会把 1px 笔画糊掉）供目检与多模态
-识别，另提供 `--region` 数区域墨量。写它时踩到极性反了（1=黑却按 1=白渲染，
-整屏全黑）——墨水屏面板置位=黑。
+真拒绝无关——qzjs 的 interrupt 测试就这么全绿的）。用 `os/test/pbm_view.py` 渲 PNG
+供目检与多模态识别，另提供 `--region` 数区域墨量。
 
-**否定项必须配正对照**：同一个包造两份、**只改 manifest**，合法那份必须出现标记
-（证明区域判据测得动），非法那份必须没有。阈值取正对照的一半而非 0——取 0 的话
-一颗散点就让断言飘红，而那种红不指向任何真问题。标记区必须选在**三种画面
-（桌面/详情页/正常应用）都不占用**的行（实测 y≥126），否则会撞上 back 按钮下沿
-（第一次取 y=120 就撞上了，正对照 170 / 负判据 581，方向都反了）。
+**否定项必须配正对照**：同一个包造两份、**只改 manifest**，合法那份必须出现标记，
+非法那份必须没有。阈值取正对照的一半而非 0。标记区必须选在三种画面都不占用的行
+（y≥126），否则会撞上 back 按钮下沿（第一次取 y=120 就撞上了，方向都反了）。
 
-已做变异测试（6 个 mutant 全部会红）：漏遮 `__native__`（13 条红）、绝对路径拼到
-app.dir（7 条）、同前缀路径漏洞、缺 statMode 时 fail-open、静默忽略表外能力、
-把校验结果一律当通过（端到端 2 条红）。
+**测 C 侧边界的 fixture 必须放内置目录**：放用户目录会被 fail-closed 清空 perms，
+测到的就成了「全被拒」而不是「按 perms 放行」。
 
-测试自身抓出两个真 bug：`sandbox.resolveIn` 把绝对路径拼到 app.dir，导致
-`/etc/passwd` 归一化成 `<dir>/etc/passwd` 判成包内（7 条断言红）；以及注释与代码
-不符（声称「按 8 行条带抽样」而代码是 `y += 2`）。
+已做 9 个变异测试（全部会红）：漏遮 `__native__`、绝对路径拼到 app.dir、同前缀
+路径漏洞、缺 statMode 时 fail-open、静默忽略表外能力、校验形同虚设、详情页退不出、
+拆掉 C 侧边界、内置应用也 fail-closed。
+
+测试与实现自身抓出的真 bug：`sandbox.resolveIn` 把绝对路径拼到 `app.dir`（`/etc/passwd`
+判成包内）；`scanDir` 里读未定义的 `g` 在 `'use strict'` 下抛 `ReferenceError`，
+被 `listApps` 的 catch 吞成空列表（表现为「0 apps」，极其难查）。
 
 
 ## Timeline
@@ -186,5 +193,17 @@ app.dir（7 条）、同前缀路径漏洞、缺 statMode 时 fail-open、静默
 - time: 2026-09-30T07:14:42
   kind: decision
   summary: "已实现并闸门化（82 单测 + 5 端到端）；补记目检通道 pbm_view.py 与测试自身抓出的真 bug（绝对路径拼到 app.dir）"
+  source: brain update-truth
+  affects: [qzos-app-package]
+
+- time: 2026-09-30T08:55:30
+  kind: reversal
+  summary: "翻正「目录信任一律 fail-closed」这条：一刀切会让**内置**应用（随仓发布、只读 rootfs）也拿不到 perms，hello 的 sys.info 静默失效——而 11 项键盘端到端全绿，因为那条断言只看「画面变了没」。改为分两路：用户目录 statMode 恒 null 故 fail-closed（正确），内置目录可信性来自「随仓发布」而非目录权限位。同时补上 C 侧方法名边界（bridge.c 新增 op_app + app_allows，op_rpc 就地拒绝），此前宿主根本没有 op:app 这个 op，shell 用 ui.rpc('app') 发它会永不 settle（.catch 只处理 rejection，不处理永不 settle），每次 launch/back 泄漏一个 rpcPending"
+  source: "brain append-timeline：9 项端到端闸门 + 3 个变异测试"
+  affects: [qzos-app-package, qzos-js-first]
+
+- time: 2026-09-30T08:56:15
+  kind: decision
+  summary: "补上 C 侧方法名边界（bridge.c op_app + app_allows）；信任分两路（用户目录 fail-closed、内置目录可信）；op:app 改走独立通知通道 ui.setApp（原 ui.rpc 会永不 settle 并泄漏 rpcPending）；back() 判据改用 s_on_detail 而非 ctx"
   source: brain update-truth
   affects: [qzos-app-package]

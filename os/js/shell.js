@@ -37,12 +37,13 @@
   var APKG = globalThis.QZOS_APKG;
   var sandbox = globalThis.QZOS_SANDBOX.install();
 
-  var ctx = null;        /* 当前运行的应用上下文；null = 在桌面 */
+  var ctx = null;        /* 当前运行的应用上下文；null = 在桌面或坏包详情页 */
+  var s_on_detail = false; /* 坏包详情页是否正在显示（back 的判据，见 back()） */
   var requireCache = {}; /* api.require 的模块缓存，每次 back 清空 */
 
   /* ---- 1. 应用发现 ---- */
 
-  async function scanDir(base) {
+  async function scanDir(base, builtin) {
     var apps = [];
     var entries = [];
     try {
@@ -68,16 +69,25 @@
        * 注意是「拒绝启动这个应用」而不是「降级启动」：带着残缺契约跑起来
        * 比不跑更难查。
        *
-       * 目录信任目前拿不到：JS 侧没有 stat（qzjs.fs 与 __native__ 都没有，
-       * 实测），statMode 原语还没实现（brain qzos-app-package）。所以这里
-       * 一律按**不可信**处理 → perms 被清空。fail-closed：等原语到位后
-       * 自动变可信，不需要改这里。 */
+       * 目录信任分两路，**不能一刀切 fail-closed**：
+       *
+       *  - 用户目录（APP_DIR，默认 /storage）：statMode 原语还没实现（JS 侧
+       *    没有 stat，qzjs.fs 与 __native__ 都没有，实测），所以判定为不可信
+       *    → perms 清空。这是 fail-closed：静默当作可信等于给整个授权模型
+       *    开后门，且没人会发现。
+       *  - **内置目录（JS_DIR/apps，随仓发布、只读 rootfs 上不可写）不在这条
+       *    规则之内**：它是系统的一部分，可信性来自「随仓发布」而不是「目录
+       *    权限位」。早先一刀切 fail-closed 之后，内置的 hello 拿不到
+       *    perms:["info"]，它的 sys.info 按钮静默失效——而 11 项键盘端到端
+       *    全绿，因为那条断言只看「画面变了没」，没看画面上是不是错误信息。
+       *    这就是「回执/表象层面的断言替代效果层面断言」又中一次。
+       */
       var v = APKG.validate(meta, dir);
       if (!v.ok) {
         apps.push(broken(name, dir, v.errors.map(function (e) { return e.code; }).join(',')));
         continue;
       }
-      var trusted = APKG.dirTrusted(dir, base, null); /* null => fail-closed */
+      var trusted = builtin ? true : APKG.dirTrusted(dir, base, null);
       apps.push({
         id: meta.id,
         name: meta.name,
@@ -101,7 +111,7 @@
     var apps = [];
     var groups = [JS_DIR + '/apps', APP_DIR];
     for (var g = 0; g < groups.length; g++) {
-      var found = await scanDir(groups[g]);
+      var found = await scanDir(groups[g], g === 0);
       for (var i = 0; i < found.length; i++) {
         if (seen[found[i].id]) continue;
         seen[found[i].id] = true;
@@ -116,6 +126,7 @@
 
   function renderDesktop(apps) {
     ui.clear();
+    s_on_detail = false;
     var ok_ = apps.filter(function (a) { return !a.broken; });
     var bad = apps.filter(function (a) { return a.broken; });
     ui.create('label', { id: 'dsl-title',
@@ -142,6 +153,7 @@
 
   function showBroken(app) {
     ui.clear();
+    s_on_detail = true;
     ui.create('label', { id: 'bad-t', text: app.id, x: 4, y: 4, w: 288, font: 'md' });
     ui.create('label', { id: 'bad-why', text: String(app.broken).slice(0, 120),
                          x: 4, y: 34, w: 288, font: 'sm' });
@@ -160,10 +172,9 @@
     /* 装当前应用上下文（授权面 + 宿主侧方法名边界）。必须在**读 entry 之前**：
      * 读文件本身就走面，面必须先到位，否则这一步是未授权的。 */
     sandbox.setApp(app.dir, app.perms);
-    /* 不能 await：宿主对未知 op 不回响应（bridge.c 只处理认识的 op），await
-     * 会永远挂住，桌面就再也渲染不出来。op:app 是通知，失败也不该阻断启动。 */
-    try { ui.rpc('app', { id: app.id, perms: app.perms }).catch(function () {}); }
-    catch (e) { /* 宿主未实现 op:app 时忽略 */ }
+    /* 通知类，走独立的 op（不是 ui.rpc——那条要回执，用在这里会挂死）。
+     * 必须在**读 entry 之前**发：读文件走面，面要先到位。 */
+    ui.setApp(app.id, app.perms);
 
     /* 每次 launch 用**新数组**，不重置模块级那个：back() 可能与 launch 交错，
      * 重置模块级数组会把上一个应用还没跑的收尾回调清掉。 */
@@ -209,21 +220,33 @@
       postMessage({ evt: 'error', msg: 'launch ' + app.id + ': ' + err });
       /* 启动失败也必须收权并清面，否则桌面态下残留的应用授权会一直生效 */
       sandbox.clearApp();
-      try { ui.rpc('app', { id: null, perms: [] }); } catch (e) { /* ignore */ }
+      ui.setApp(null, []);
       ctx = null;
       renderDesktop(await listApps());
     }
   }
 
   async function back() {
-    if (!ctx) return; /* 已在桌面 */
+    /* ctx 为空**不等于**「无事可做」。坏包详情页就是 ctx 为空的状态——那里
+     * 仍然需要 back 能退回桌面。早先写成 `if (!ctx) return;`，于是详情页上的
+     * back 按钮与系统 back 键都退不出去，用户被卡住只能重启。
+     * 「已在桌面」的正确判据是画面上有没有桌面，而不是有没有应用上下文。 */
+    if (!ctx) {
+      /* 已在桌面就别重画：否则按 back 会引发一次全刷，白耗墨水屏寿命
+       * （e-ink 硬约束：无事不刷）。详情页与桌面都能靠 title 区分。 */
+      if (!s_on_detail) return;
+      s_on_detail = false;
+      renderDesktop(await listApps());
+      return;
+    }
     /* 顺序：先取钩子 → 再清 ctx/收权 → 最后跑钩子。应用代码在 onExit 里
      * 还可能碰 fs / rpc，此时它应该已经没有授权了；反过来做等于给
      * 「正在退出的应用」多留一段授权窗口。 */
     var hooks = ctx.exitHooks ? ctx.exitHooks.slice() : [];
     ctx = null;
+    s_on_detail = false;
     sandbox.clearApp();
-    try { ui.rpc('app', { id: null, perms: [] }); } catch (e) { /* ignore */ }
+    ui.setApp(null, []);
     /* 清掉模块缓存：下次 launch 重新求值，否则上一个应用的模块状态会漏给下一个 */
     for (var k in requireCache) { delete requireCache[k]; }
     try {
@@ -249,8 +272,9 @@
     if (key === 'back') {
       back();
     } else if (key === 'home') {
-      ctx = null;
-      listApps().then(renderDesktop);
+      /* home 强制回桌面：即便有应用在跑也要收权 + 跑收尾钩子，走 back() 而不是
+       * 只把 ctx 置空——否则会漏掉 onExit 与授权清理。 */
+      back();
     } else if (key === 'volup' || key === 'voldown') {
       /* v1: 无背光服务，忽略 */
     }

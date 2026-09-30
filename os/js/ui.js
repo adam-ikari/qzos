@@ -70,6 +70,23 @@
       });
     },
 
+    /* ---- 当前应用授权（宿主侧方法名边界）----
+     *
+     * 必须走独立的 op 而不是 ui.rpc：rpc 是**请求-应答**通道，需要宿主回
+     * {evt:'rpc',rid}。而 op:app 是通知——宿主处理完不回任何东西。曾经把它
+     * 写成 ui.rpc('app', …)，结果是请求发出去后宿主找不到这个 method、永不
+     * 应答，promise 永远不 settle，.catch() 也永远不触发（它只处理
+     * rejection，不处理「永不 settle」）。每次 launch/back 各泄漏一个
+     * rpcPending 条目。50 MiB 的设备上不能这么攒。
+     *
+     * 顺带说明为什么通知类通道不该复用请求-应答通道：没有 rid、没有回执，
+     * 宿主对它的沉默是**正确**行为，而调用方无法区分「处理完了」与
+     * 「根本没听见」。
+     */
+    setApp: function (id, perms) {
+      send({ op: 'app', id: id === undefined ? null : id, perms: perms || [] });
+    },
+
     /* ---- 宿主事件分发（由 shell 的 __qzos_onmessage 调用） ---- */
     _dispatch: function (evt) {
       switch (evt.evt) {
