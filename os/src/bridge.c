@@ -496,7 +496,27 @@ void qzos_bridge_handle(const char *json, size_t len)
          *
          * 所以这里转成 rtError 投给 JS，并请宿主安排重建（见 main.c）。 */
         const char *type = cJSON_GetStringValue(cJSON_GetObjectItem(j, "type"));
-        if (type && strcmp(type, "error") == 0) {
+        /* shell 的 {evt:'shellReady'}：它画完桌面了。放开开机提交按住，让首帧
+         * 携带真正的桌面而不是空白屏（见 qzos_display_hold 的说明）。
+         * 注意这跟引擎死亡是**相反**的方向：shellReady 之前屏幕故意是空白的，
+         * 死亡时屏幕已经有过内容、我们要显式盖住。
+         *
+         * 只认 shellReady，不认宿主 boot 脚本发的那句 {evt:'ready'}：那里是
+         * (0, eval)(shell.js) 之后立刻发的，而 shell.js 是 async IIFE，
+         * 它的 await 还没跑完 —— 那个信号到达时桌面还没画。 */
+        const char *evt = cJSON_GetStringValue(cJSON_GetObjectItem(j, "evt"));
+        if (evt && strcmp(evt, "shellReady") == 0) {
+            qzos_display_hold(0);
+        } else if (evt && strcmp(evt, "bootFailed") == 0) {
+            /* shell 根本没起来（读不到 / 语法错）。此时屏幕上什么都没有，
+             * 而用户面对一台墨水屏一体机时看到纯白 = 「死机了，但我不知道为什么」。
+             * 所以显式盖一块故障屏——和引擎死亡同一块屏、同一套信息。
+             * 先放开提交按住，否则这块屏自己也落不下去。 */
+            const char *msg = cJSON_GetStringValue(cJSON_GetObjectItem(j, "msg"));
+            fprintf(stderr, "qzos-host: shell boot failed: %s\n", msg ? msg : "?");
+            qzos_display_hold(0);
+            qzos_show_boot_failed(msg);
+        } else if (type && strcmp(type, "error") == 0) {
             const char *err = cJSON_GetStringValue(cJSON_GetObjectItem(j, "error"));
             fprintf(stderr, "[js] engine error: %s\n", err ? err : "(none)");
             qzos_host_on_rt_death(err);

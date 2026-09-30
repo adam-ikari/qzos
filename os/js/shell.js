@@ -291,6 +291,17 @@
   var apps = await listApps();
   renderDesktop(apps);
   ui.refresh(true); /* 首帧全刷 */
+  /* 告诉宿主「可以显示了」。
+   *
+   * 不能靠宿主 boot 脚本里那句 postMessage({evt:'ready'})：那里是
+   *   (0, eval)(src);  postMessage({evt:'ready'});
+   * 而 shell.js 本身是 async IIFE，eval 立即返回、它自己的 await（加载
+   * ui/apkg/sandbox、扫目录）都在之后才跑 —— 所以 ready 到达时桌面**还没画**。
+   * 宿主据此放开提交按住，就会先落一帧空白屏，再落桌面 = 两次全刷（e-ink
+   * 浪费），而且慢构建上必然发生、Release 上碰巧不发生。
+   * 「什么时候能显示了」只有 shell 自己知道，所以信号必须由它发。
+   */
+  postMessage({ evt: 'shellReady' });
   console.log('[shell] up, ' + apps.length + ' apps');
 
   /* 曾经这里有个 setInterval(…, 5000) 心跳，注释说「主 RT 会 idle 自退，

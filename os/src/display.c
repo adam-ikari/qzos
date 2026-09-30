@@ -82,6 +82,7 @@ static qzos_dirty_t s_dirty;                /* 自上次落屏以来的累计脏
 static qzos_policy_t s_policy;
 static lv_display_t *s_disp;
 static bool s_need_commit;                  /* 有新像素待决策 */
+static bool s_commit_held;                  /* 开机按住提交，等 shell ready */
 static bool s_raw_enabled;
 static uint8_t *s_l8_shadow;                /* L8 影子帧，仅 QZ_DUMP_RAW 时分配 */
 
@@ -206,6 +207,9 @@ int qzos_display_init(void)
     s_have_written = false;                     /* …但它不是真帧，见 debug_dump_change */
     qzos_dirty_reset(&s_dirty);
     s_need_commit = false;
+    /* 开机先按住提交：见 qzos_display_hold 的说明。shell 画出桌面后由宿主
+     * 释放（收到 JS 的 {evt:'ready'}），或由兜底定时器释放。 */
+    s_commit_held = true;
 
     const backend_t *be = backend();
     s_raw_enabled = be->dump_raw || (getenv("QZ_DUMP_RAW") != NULL);
@@ -264,6 +268,23 @@ bool qzos_display_dirty_region(int32_t *x, int32_t *y, int32_t *w, int32_t *h)
 
 void qzos_display_commit(void)
 {
+    /* 开机按住期间不落屏。为什么要它：
+     *
+     * 首帧提交是**构造上强制**的（s_written 初始化成 0xFF，见 init），所以
+     * 开机必然先刷一帧全屏。若 shell 此时还没画完，屏上落的是**空白屏**，
+     * 紧接着桌面画好再刷第二帧 —— 两次全刷白费一次波形（e-ink 硬约束：
+     * 无事不刷）。
+     *
+     * 什么时候会变成两次，取决于 shell boot 快慢：Release 构建里 JS 画完
+     * 早于第一个 LVGL tick，于是只有一帧；ASan/Debug 构建里慢，就裂成两帧。
+     * 实测确认过（ASan 下 boot=2，Release 下 boot=1）。这不只是浪费——它还
+     * 让 verify-input.sh 的刷新预算断言在慢机器上**假红**：一个在快机绿、
+     * 慢机红的闸门不是闸门。
+     *
+     * 所以这里按住提交，等 shell 报 ready（或兜底定时器）再放。放行后首帧
+     * 携带的就是真正的桌面，恒为一次全刷。
+     */
+    if (s_commit_held) return;
     if (!s_need_commit) return;
     s_need_commit = false;
 
@@ -425,4 +446,62 @@ void qzos_hide_rt_dead(void)
     s_rt_dead_box = NULL;
     fprintf(stderr, "qzos-display: engine-dead notice cleared\n");
     qzos_display_repaint();
+}
+
+void qzos_display_hold(int on)
+{
+    s_commit_held = on ? true : false;
+    if (!s_commit_held && s_need_commit) {
+        /* 放开时立刻提交一次：按住期间 LVGL 一直在画，内容已经就绪。
+         * 这里不能等下一个 tick——那会让用户在桌面上多等 33ms 才能看到东西，
+         * 而这台设备是墨水屏，多一次提交就多一次波形。 */
+        qzos_display_commit();
+    }
+}
+
+/* shell 起不来时的故障屏。与引擎死亡用同一块框、同一套信息——用户看到的是
+ * 同一类现象（屏幕不动、没有解释），区别只在标题行。
+ *
+ * 这个缺口是实测出来的：QZ_JS_DIR 指到不存在的目录时，兜底定时器会放开提交
+ * 并把 LVGL 初始化后的样子（全白）落屏，用户拿到一块**纯白屏 + 零诊断**。
+ * 对一台只能靠 USB ADB 救的墨水屏一体机来说，那等于「设备坏了且不知道为什么」。 */
+static void notice_box(const char *title, const char *body, bool with_countdown)
+{
+    s_rt_dead_box = lv_obj_create(lv_screen_active());
+    lv_obj_remove_style_all(s_rt_dead_box);
+    lv_obj_set_style_bg_color(s_rt_dead_box, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(s_rt_dead_box, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_width(s_rt_dead_box, 1, 0);
+    lv_obj_set_style_border_color(s_rt_dead_box, lv_color_black(), 0);
+    lv_obj_set_style_radius(s_rt_dead_box, 0, 0);
+    lv_obj_set_size(s_rt_dead_box, 292, with_countdown ? 80 : 90);
+    lv_obj_align(s_rt_dead_box, LV_ALIGN_CENTER, 0, 0);
+
+    lv_obj_t *t1 = lv_label_create(s_rt_dead_box);
+    lv_obj_remove_style_all(t1);
+    lv_obj_set_style_text_color(t1, lv_color_black(), 0);
+    lv_label_set_text(t1, title);
+    lv_obj_align(t1, LV_ALIGN_TOP_MID, 0, 12);
+
+    lv_obj_t *t2 = lv_label_create(s_rt_dead_box);
+    lv_obj_remove_style_all(t2);
+    lv_obj_set_style_text_color(t2, lv_color_black(), 0);
+    char buf[72];
+    snprintf(buf, sizeof(buf), "%s", body ? body : "");
+    lv_label_set_text(t2, buf);
+    if (!with_countdown) {
+        /* 错误串可能很长，1bpp 屏上一行放不下。截断要显式（DOT 模式画省略号），
+         * 否则用户看不出后面被截了。 */
+        lv_obj_set_width(t2, 272);
+        lv_label_set_long_mode(t2, LV_LABEL_LONG_MODE_DOTS);
+    }
+    lv_obj_align(t2, LV_ALIGN_BOTTOM_MID, 0, -12);
+}
+
+void qzos_show_boot_failed(const char *msg)
+{
+    if (!s_rt_dead_box) notice_box("Shell failed to start", msg, false);
+    fprintf(stderr, "qzos-display: boot-failed notice shown\n");
+    qzos_display_repaint();
+    qzos_display_full_refresh();
 }

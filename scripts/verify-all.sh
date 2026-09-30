@@ -39,5 +39,8 @@ bash scripts/verify-input.sh
 step "frame consistency: native == MIPS (qemu-user)"
 bash scripts/verify-frames.sh
 
+step "MIPS end-to-end (qemu-user: app model, auth facade, keyboard)"
+bash scripts/verify-mips-e2e.sh
+
 echo
 echo "ALL PASS"

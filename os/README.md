@@ -195,9 +195,16 @@ bash scripts/verify-all.sh
 | `os/test/verify-rt-recovery.sh` | JS 引擎崩溃恢复：杀 `qzjs-rt`，断言屏上出现提示、rt 被重建、桌面逐字节复现、开机失败也留在退避循环 | 是 / 否 |
 | `scripts/verify-input.sh` | 键盘端到端（`QZ_INPUT0` 接 FIFO 回放）+ e-ink 刷新预算 | 是 / 否 |
 | `scripts/verify-frames.sh` | 原生 vs MIPS 帧逐字节一致（MIPS 经 qemu-user） | 是 / 否 |
+| `scripts/verify-mips-e2e.sh` | MIPS 端到端：桌面/键盘/应用发现/授权遮蔽在 qemu-user 下逐条验 | 是 / 否 |
 | `tools/rpc-ipc-selftest.sh` | uvrpc 外部 IPC 客户端调 `sys.info` | 是 / 否 |
 
 前三项是毫秒级的纯逻辑单测——上层现象不对时先确认它们是绿的，否则容易在上层猜错方向。
+
+**跑闸门要看退出码，不要只看断言行。** 曾经 `verify-frames.sh` 里
+`frame-preview.sh | head -3` 让 preview 收到 SIGPIPE 返回 141，`set -euo pipefail`
+让整个脚本以 141 退出——**每一条断言都打印了 PASS，但 `verify-all.sh` 的
+「ALL PASS」从来没出现过**，而且它后面挂的步骤根本不会跑。只 grep 断言行会把
+这种失败看成全绿。已改用 `sed -n '1,3p'`（读完输入、不产生 SIGPIPE）。
 
 **这些通道替代不了真机**：`/dev/epaper_lcd` 只写不可读，落屏波形、残影、真实 evdev 行为、刷新耗时与视觉本身，只能人眼在设备上看（另见 brain `port-verification`）。
 

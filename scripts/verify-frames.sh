@@ -92,7 +92,16 @@ done
 if cmp -s "$OUT/native.pbm" "$OUT/mips.pbm"; then
   echo
   echo "PASS: native == mips ($(wc -c <"$OUT/native.pbm") bytes identical)"
-  bash scripts/frame-preview.sh "$OUT/native.pbm" | head -3
+  # 用 sed -n '1,3p' 而不是 | head -3。
+  #
+  # head 读够 3 行就退出并关掉管道，frame-preview.sh 往已关闭的管道写 → SIGPIPE
+  # → 返回 141 → 本脚本 set -euo pipefail 直接以 141 退出。
+  # 后果很阴：**每一条断言都打印了 PASS，但 verify-all.sh 的「ALL PASS」从来没
+  # 出现过**，而且 verify-all.sh 后面挂的步骤（现在是 MIPS 端到端）根本不会跑。
+  # 我连着几轮只看 grep 出来的断言行，全绿就当通过了——「部件都绿但整体失败」
+  # 只有看退出码才看得见。
+  # sed -n '1,3p' 会把输入读完，不产生 SIGPIPE。
+  bash scripts/frame-preview.sh "$OUT/native.pbm" | sed -n '1,3p'
   [ "${KEEP:-0}" = 1 ] || true
 else
   echo

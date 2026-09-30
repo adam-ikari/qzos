@@ -219,6 +219,24 @@ static void restart_cb(uv_timer_t *t)
     fprintf(stderr, "qzos-host: input re-enabled\n");
 }
 
+/* 开机提交按住的兜底释放。
+ *
+ * 正常路径是 shell 画完桌面后发 {evt:'ready'}，bridge 放开提交。但若 shell
+ * 自己挂了（脚本语法错、模块读不到、rt 早死），就永远等不到 ready —— 屏会一直
+ * 空白，而用户看到的设备是「黑屏/白屏」，只能拔电。所以必须有兜底：
+ * 到点无条件放开，让屏上出现「LVGL 初始化后的样子」而不是什么都没有。
+ * 没有这一条的话，「按住提交」这个优化就会在 shell 故障时变成故障放大器。 */
+static uv_timer_t s_hold_timer;
+
+static void hold_timeout_cb(uv_timer_t *t)
+{
+    (void)t;
+    uv_timer_stop(&s_hold_timer);
+    uv_close((uv_handle_t *)&s_hold_timer, NULL);
+    fprintf(stderr, "qzos-host: shell never signalled ready; releasing display hold\n");
+    qzos_display_hold(0);
+}
+
 static void on_sigint(int sig)
 {
     (void)sig;
@@ -248,24 +266,48 @@ int main(void)
     if (!js_dir) js_dir = "js";
 
     /* boot: install the onmessage dispatcher, then self-load the shell
-     * bundle (shell.js) via qzjs.fs + eval; shell takes it from there. */
-    static char boot_script[1024];
+     * bundle (shell.js) via qzjs.fs + eval; shell takes it from there.
+     *
+     * boot 脚本只在这里构造一次，存进 s_boot_script（文件作用域）——rt 崩溃
+     * 重建时要重跑的就是它。曾经这里还有一个局部 boot_script 填完就没人读，
+     * 属于重构残留的死代码：两份 boot 脚本会各自漂移，而只有一份生效。 */
     const char *app_dir = getenv("QZ_APP_DIR");
     if (!app_dir) app_dir = "/storage";
-    snprintf(boot_script, sizeof(boot_script),
+
+    /* 测试专用：人为拖慢 shell boot，让「首帧提交与桌面绘制撞车」这条慢路径
+     * **确定性地**发生。
+     *
+     * 没有它的话，开机提交数在快机器上恒为 1（碰巧对），于是「去掉提交按住」
+     * 这个变异也能全绿——闸门抓不住自己该抓的回归。实测那条路径只有在
+     * ASan/Debug 构建下才会自然出现，而 CI 的机器时快时慢。
+     * 用法：QZ_TEST_SHELL_DELAY_MS=400 */
+    char delay_js[96] = "";
+    {
+        const char *d = getenv("QZ_TEST_SHELL_DELAY_MS");
+        int ms = (d && *d) ? atoi(d) : 0;
+        if (ms > 0)
+            snprintf(delay_js, sizeof(delay_js),
+                     "    await new Promise(function (r) { setTimeout(r, %d); });\n", ms);
+    }
+
+    snprintf(s_boot_script, sizeof(s_boot_script),
              "%s\n"
              "globalThis.__QZ_JS_DIR = '%s';\n"
              "globalThis.__QZ_APP_DIR = '%s';\n"
              "(async function () {\n"
              "  try {\n"
              "    var src = await qzjs.fs.readFile('%s/shell.js');\n"
+             "%s"
              "    (0, eval)(src);\n"
-             "    postMessage({evt: 'ready'});\n"
              "  } catch (err) {\n"
-             "    postMessage({evt: 'error', msg: String(err)});\n"
+             /* bootFailed 与 shell 自己发的 evt:error 必须分开：前者在桌面出现
+              * 之前发生（用户面对纯白屏、零诊断），后者是某个应用启动失败
+              * （桌面还在）。混用一个事件名会让宿主在应用启动失败时也去盖
+              * 「系统故障」屏。 */
+             "    postMessage({evt: 'bootFailed', msg: String(err)});\n"
              "  }\n"
              "})();\n",
-             BOOT_DISPATCHER, js_dir, app_dir, js_dir);
+             BOOT_DISPATCHER, js_dir, app_dir, js_dir, delay_js);
 
     if (uv_loop_init(&s_loop) != 0) {
         fprintf(stderr, "qzos-host: uv_loop_init failed\n");
@@ -309,23 +351,6 @@ int main(void)
         }
     }
 
-    /* boot 脚本要跨 rt 重建复用（重启时重跑的就是它），所以存成文件作用域 */
-    snprintf(s_boot_script, sizeof(s_boot_script),
-             "%s\n"
-             "globalThis.__QZ_JS_DIR = '%s';\n"
-             "globalThis.__QZ_APP_DIR = '%s';\n"
-             "(async function () {\n"
-             "  try {\n"
-             "    var src = await qzjs.fs.readFile('%s/shell.js');\n"
-             "    (0, eval)(src);\n"
-             "    postMessage({evt: 'ready'});\n"
-             "  } catch (err) {\n"
-             "    postMessage({evt: 'error', msg: String(err)});\n"
-             "  }\n"
-             "})();\n",
-             BOOT_DISPATCHER, js_dir, app_dir, js_dir);
-    snprintf(boot_script, sizeof(boot_script), "%s", s_boot_script);
-
     /* 开机时 rt 起不来**不能退出**：设备是墨水屏一体机，宿主一退就是黑屏，
      * 用户只能等电池耗尽或物理断电。留在退避循环里，qzjs-rt 一旦就位
      * （比如 /storage 还没挂载完、文件被占）就自动起来。
@@ -335,6 +360,18 @@ int main(void)
         qzos_show_rt_dead(s_restart_delay_ms);
         qzos_input_enable(0);
         arm_restart_again();
+    }
+
+    /* 兜底：QZ_HOLD_MAX_S 秒后无条件放开提交（默认 4s）。
+     * 用环境变量而不是常量，是为了让 qemu/慢机器上的测试能调短——ASan 构建
+     * 里 shell boot 明显更慢，写死 4s 会让测试等很久。 */
+    {
+        int hold_max = 4;
+        const char *hm = getenv("QZ_HOLD_MAX_S");
+        if (hm && *hm) { int v = atoi(hm); if (v > 0) hold_max = v; }
+        uv_timer_init(&s_loop, &s_hold_timer);
+        uv_timer_start(&s_hold_timer, hold_timeout_cb,
+                       (uint64_t)hold_max * 1000u, 0);
     }
 
     fprintf(stderr, "qzos-host: up (display=%s)\n", getenv("QZ_DISPLAY") ? getenv("QZ_DISPLAY") : "epaper");

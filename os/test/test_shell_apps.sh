@@ -176,13 +176,43 @@ fi
 # 判据用**提交次数**而不是帧内容：帧是状态的纯函数，重绘出一模一样的帧在内容
 # 上分不出来，但驱动已经刷过一次波形了——那正是要避免的浪费。
 # （第一版误用 cmp 比帧，两个 run 的按键时序不同导致假失败。）
-commits() { grep -c "qzos-display: commit" "$1" 2>/dev/null || true; }
+# grep 必须容忍毫秒时间戳前缀。实际行是
+#   qzos-display: [ 12345 ms] commit full …
+# 写成 "qzos-display: commit" 匹配不到、一律返回 0，而判据是「<= 1」——于是
+# 这条断言**因为测量坏了而绿**，不是「真的没重绘」。
+# 第 7 条与第 7b 条都栽在这上面，是被 7b 的「期望恰好 1 次」顶出来的：
+# 7b 期望 1 却读到 0，追下去才发现 commits() 早就匹配不到了。
+# 与 verify-input.sh / verify-rt-recovery.sh 踩的是同一个坑（同一个仓库里第
+# 三次），所以这里的注释写得很啰嗦——第四次不该再有人踩。
+commits() { grep -cE "qzos-display: (\[ *[0-9]+ ms\] )?commit " "$1" 2>/dev/null || true; }
 run_desk "$OUT/apps" nav_stay "back"
 stay_n=$(commits "$OUT/nav_stay.log")
 if [ "${stay_n:-99}" -le 1 ]; then
   ok "桌面态按 back 不重绘（提交 ${stay_n} 次，只有启动那一帧）"
 else
   bad "桌面态按 back 引发重绘（提交 ${stay_n} 次，白耗墨水屏波形）"
+fi
+
+# ---- 7b. 慢 boot 下开机仍只有一次提交（e-ink 波形不白刷）----
+# 这一条是「全检验」时挖出来的缺陷的护栏。
+#
+# 首帧提交是构造上强制的（s_written 初始化成 0xFF），所以若 shell 还没画完，
+# 屏上先落一帧**空白屏**，桌面画好再落第二帧 = 两次全刷。而这个撞不撞车取决
+# 于时序：Release 构建里 JS 画完早于第一个 LVGL tick，恒为 1 次；ASan/Debug 里
+# 慢，就裂成 2 次。
+#
+# 所以断言必须**确定性地**制造慢路径，不能指望 CI 机器够慢。用
+# QZ_TEST_SHELL_DELAY_MS 在 boot 脚本里插一个延时，逼出撞车。
+QZ_TEST_SHELL_DELAY_MS=600 run_desk "$OUT/apps" slowboot "back"
+slow_n=$(commits "$OUT/slowboot.log")
+# 必须**恰好** 1 次：写成 "<= 1" 的话，0 次也会通过，而 0 次意味着桌面根本没
+# 落屏（比白刷一次更糟）。这个弱断言是我第一版的写法，被自己的测试数据顶回来
+# 的——它报「提交 0 次」时我先怀疑的是数据，第二反应才是不该这么写。
+slow_ink=$(ink_at "$OUT/slowboot.pbm" 8,41,280,16)
+if [ "${slow_n:-0}" -eq 1 ] && [ "${slow_ink:-0}" -gt 100 ]; then
+  ok "慢 boot 下桌面恰好落 1 次屏（提交 ${slow_n}，应用行墨量 ${slow_ink}）"
+else
+  bad "慢 boot 下提交 ${slow_n} 次 / 应用行墨量 ${slow_ink}（期望 1 次且桌面可见）"
 fi
 
 # ---- 8. 给人留一张能直接看的图 ----

@@ -28,7 +28,32 @@ VIEW="python3 os/test/pbm_view.py"
 [ -x "$HOST" ] || { echo "missing $HOST — run scripts/build-os.sh" >&2; exit 1; }
 
 OUT=$(mktemp -d)
-trap 'rm -rf "$OUT"; pkill -f "build-os/qzos-host" 2>/dev/null || true; pkill -x qzjs-rt 2>/dev/null || true' EXIT
+# 只杀**自己**启动的进程，绝不 pkill 全局名字。
+#
+# 原先 trap 里是 `pkill -f build-os/qzos-host` + `pkill -x qzjs-rt`。后者是
+# 按进程名全局杀：verify-all.sh 里本脚本跑在 verify-input.sh **之前**，本脚本
+# 退出时那些 rt 可能还没完全收干净，而 verify-input 紧接着就起了自己的 rt ——
+# 两者时间窗重叠时，那个 pkill 会把**别人的** rt 杀掉。
+# 症状极难认：表现为 verify-input 的 boot 场景莫名其妙刷了 3 次（桌面 + 引擎
+# 死亡提示 + 重画桌面），日志里混着本脚本根本不该出现的
+# "JS engine died ... restart in 1000ms"。单独跑 verify-input 6 次全正常，
+# 只有全量跑才偶发——典型的跨测试干扰。
+#
+# 所以：杀宿主用记下的 $HPID，杀 rt 用「宿主的子进程」。
+kill_own_rt() { for p in $(own_rt_pids); do kill "$p" 2>/dev/null || true; done; }
+
+# 列出「本宿主的 qzjs-rt」pid。
+#
+# 写这段时我一度以为 rt 是孙进程（宿主 → 中间层 → rt），于是写了个两级遍历；
+# 用 ps --forest 量了才发现 **rt 是宿主的直接子进程**，两级遍历反而找不到它
+# （pgrep -P 中间层返回空）。教训：进程树形状要用 ps/pstree 量，不要凭印象。
+# 仍然按 comm 过滤，而不是只靠父子关系——这样万一将来多出别的子进程也不会误杀。
+own_rt_pids() {
+  local p
+  for p in $(pgrep -P "$HPID" 2>/dev/null); do
+    [ "$(cat /proc/$p/comm 2>/dev/null)" = "qzjs-rt" ] && echo "$p"
+  done
+}
 pass=0; fail=0
 ok()  { echo "  PASS  $*"; pass=$((pass+1)); }
 bad() { echo "  FAIL  $*"; fail=$((fail+1)); }
@@ -38,6 +63,8 @@ QZ_DISPLAY=pbm QZ_PBM="$OUT/f.pbm" QZ_RPC_SOCK=none QZ_JS_DIR=os/js \
   QZ_APP_DIR=os/js/apps QZ_INPUT0="$F" QZ_INPUT1= QZ_AUTOEXIT_S=22 \
   "$HOST" >"$OUT/log" 2>&1 &
 HPID=$!
+# 只杀自己起的宿主与它的 rt。
+trap 'rm -rf "$OUT"; [ -n "$HPID" ] && kill "$HPID" 2>/dev/null; kill_own_rt; exit 0' EXIT
 
 # 等桌面真的画出来（第一帧 commit）
 for _ in $(seq 1 40); do
@@ -57,11 +84,22 @@ fi
 cp "$OUT/f.pbm" "$OUT/desk-before.pbm"
 $VIEW "$OUT/f.pbm" "$OUT/before.png" --scale 3 >/dev/null
 
-# ---- 1. 杀掉 rt ----
-if pkill -x qzjs-rt; then
-  ok "已 SIGTERM 掉 qzjs-rt"
+# ---- 1. 杀掉 rt（只杀本脚本那个宿主的子进程）----
+# 判据是 **pid 变了**，不是「数量掉了」：宿主的重建退避是 1s，而这里也只等 1s，
+# 所以旧 rt 刚死新 rt 就已经起来了——按数量判会看到 1 → 1 而误报成「没杀掉」。
+# 第一版就是这么写的，症状是「测试前提不成立」而实际前提完全成立。
+rt_before=$(own_rt_pids | head -1)
+kill_own_rt
+rt_after=""
+for _ in $(seq 1 20); do
+  sleep 0.25
+  rt_after=$(own_rt_pids | head -1)
+  [ -n "$rt_after" ] && [ "$rt_after" != "$rt_before" ] && break
+done
+if [ -n "$rt_before" ] && [ -n "$rt_after" ] && [ "$rt_after" != "$rt_before" ]; then
+  ok "已 SIGTERM 掉本宿主的 qzjs-rt（${rt_before} → ${rt_after}，新进程）"
 else
-  bad "找不到 qzjs-rt 进程（测试前提不成立）"
+  bad "没能替换掉本宿主的 qzjs-rt（${rt_before:-无} → ${rt_after:-无}）"
 fi
 
 # 等重建完成（退避 1s + 重建耗时）

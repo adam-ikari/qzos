@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [system, boot, powerservice, takeover]
 created: "2026-09-30T04:19:05"
-updated: "2026-09-30T10:03:30"
+updated: "2026-09-30T14:36:34"
 ---
 
 <!-- compiled_truth -->
@@ -92,3 +92,15 @@ shell 与应用经 `op:rpc` 消费——所以推进单位是**服务**，不是
   summary: "JS 引擎崩溃恢复落地：bridge.c 认 qzjs 的 {type:error} 帧 → qzos_host_on_rt_death() 走「告知(屏上画 JS engine stopped + 倒计时) → 停输入(停 poll + 清队列) → 重建(qz_destroy+qz_create+重挂 fd+重跑 boot) → 恢复(开输入/撤提示/退避复位)」，退避 1s→30s 封顶；**开机时 rt 起不来也不退出**（墨水屏一体机宿主一退就是黑屏，只能等电池耗尽）。闸门 verify-rt-recovery.sh 11 项（杀 rt → 提示落屏 / rt 重建 / 桌面逐字节复现 / 开机失败留在退避循环且退避翻倍）。期间修掉一个必崩 bug：s_ev[] 静态零初始化使 fd==0 而非 -1，qzos_input_enable 用 fd<0 当守卫，对从未 uv_poll_init 的 handle 调 uv_poll_stop 直接段错误（gdb 定位）。另删掉 shell.js 里那个 setInterval 心跳——实测 25s 无按键主 RT 并不自退，前提不成立"
   source: "brain append-timeline：gdb 定位段错误 + 2 个变异测试确认闸门有效"
   affects: [qzos-as-system, qzos-ui-architecture]
+
+- time: 2026-09-30T14:36:18
+  kind: evidence
+  summary: "全检验挖出四个问题，全部已修：(1) 开机白刷一次全屏波形——首帧提交是构造上强制的（s_written 初始化 0xFF），shell 没画完就先落一帧空白屏。Release 下碰巧合成一帧、ASan/Debug 下裂成两帧，所以刷新预算断言在慢机器上假红。加 qzos_display_hold()（开机按住提交，shell 发 shellReady 后放开，4s 兜底）。(2) **verify-all.sh 一直在以 141 退出而每条断言都 PASS**——verify-frames.sh 里  让 preview 收到 SIGPIPE，set -euo pipefail 整体挂掉，「ALL PASS」从未打印、后面的步骤从未运行；我只 grep 断言行，连续几轮都误判为全绿。改用 sed -n '1,3p'。(3) test_shell_apps.sh 的 commits() 用了旧 pattern \"qzos-display: commit\"，匹配不到带时间戳的行 → 返回 0，使「桌面态按 back 不重绘」因测量坏了而绿（同仓第三次同类坑）。(4) verify-rt-recovery.sh 的 trap 用全局 pkill -x qzjs-rt，会杀掉后续场景的 rt，表现为 verify-input 偶发 boot 刷 3 次；改为按本宿主子树精确杀，并把「数量下降」判据改成「pid 变了」（重建退避 1s，数量不会降）。另补 MIPS 端到端闸门 6 项（此前 MIPS 只验了启动那一帧的字节一致）"
+  source: "brain append-timeline：ASan/UBSan 构建 + 3 轮全量 + fresh clone + 7 个变异测试"
+  affects: [qzos-as-system, qzos-ui-architecture, port-verification, qzos-app-package]
+
+- time: 2026-09-30T14:36:34
+  kind: evidence
+  summary: "全检验挖出四个问题。(1) 开机白刷一次全屏波形：首帧提交构造上强制，shell 未画完先落空白屏；Release 碰巧合一帧、ASan 裂成两帧，刷新预算断言因此在慢机假红。加 qzos_display_hold（开机按住，shell 发 shellReady 后放开，4s 兜底）。(2) verify-all 一直以 141 退出而每条断言都 PASS：verify-frames 里 preview 加 head 触发 SIGPIPE，set -euo pipefail 整体挂掉，ALL PASS 从未打印、后续步骤从未运行；我只 grep 断言行连续几轮误判全绿。改用 sed 读取。(3) test_shell_apps 的 commits() 用旧 pattern 匹配不到带时间戳的行，返回 0，使桌面态不重绘那条因测量坏了而绿（同仓第三次同类坑）。(4) rt-recovery 的 trap 用全局 pkill 杀 rt，会误杀后续场景的 rt，表现为 verify-input 偶发 boot 刷 3 次；改为按本宿主子树精确杀，且判据从数量下降改为 pid 变化。另补 MIPS 端到端闸门 6 项（此前 MIPS 只验启动帧字节一致）。"
+  source: "ASan/UBSan + 3 轮全量 + fresh clone + 变异测试"
+  affects: [qzos-as-system, qzos-ui-architecture, port-verification]
