@@ -77,6 +77,7 @@ static const backend_t *backend(void)
 static const qzos_panel_t *s_panel;
 static uint8_t s_frame[QZOS_FRAME_BYTES];   /* 合成后的 1bpp 帧 */
 static uint8_t s_written[QZOS_FRAME_BYTES]; /* 上次真正落屏的帧（差分基准） */
+static bool s_have_written;                  /* s_written 是否已装过一次真实帧 */
 static qzos_dirty_t s_dirty;                /* 自上次落屏以来的累计脏区 */
 static qzos_policy_t s_policy;
 static lv_display_t *s_disp;
@@ -132,6 +133,51 @@ static void flush_cb(lv_display_t *disp, const lv_area_t *area, uint8_t *px_map)
     lv_display_flush_ready(disp);
 }
 
+/* ---- 诊断：把「这次到底哪里变了」打成 ASCII（QZ_DISPLAY_DEBUG） ----
+ *
+ * 墨水屏上「无缘无故多刷了几次」几乎总是某个控件在做动画或重排，但只看
+ * changed 字节数猜不出来源——288B 可以是光标闪一下，也可以是整个按钮重画。
+ * 这里把新旧两帧在脏区内的差异逐像素打出来：'#' 本次变黑、'o' 本次变白、
+ * '.' 没变。定位这类问题靠的是"看清形状"，不是"数出字节"。
+ *
+ * 首帧没有"旧帧"可差：s_written 初始化成 0xFF（全黑）只为强制首帧落屏，
+ * 拿它当基准会印出一张"整屏刚变白"的假变化图——比不印更糟，因为它看起来
+ * 很笃定。所以首帧只说一句"没有基准"，不出图。 */
+
+static void debug_dump_change(const qzos_dirty_t *r)
+{
+    if (!s_panel || r->empty) return;
+    if (!s_have_written) {
+        fprintf(stderr, "qzos-display:   change map: (first commit, "
+                        "no previous frame to diff against)\n");
+        return;
+    }
+    /* 脏区可能很大（首帧是全屏），全打会淹掉日志：隔行抽样（y += 2），
+     * 且总行数封顶 48——要看形状，不需要看全屏每一个像素。 */
+    const int32_t x1 = r->x1, x2 = r->x2;
+    int32_t rows = 0;
+    fprintf(stderr, "qzos-display:   change map (# black, o white, . same):\n");
+    for (int32_t y = r->y1; y <= r->y2 && rows < 48; y += 2) {
+        /* 缓冲要放得下整个面板宽度（本屏 296），否则首帧那种全屏脏区会被
+         * 悄悄截掉一半——半个形状比没有形状更容易误导人。放不下时显式
+         * 收尾成 '>'，让读日志的人知道右边还有内容没打出来。 */
+        char line[320];
+        int n = 0;
+        for (int32_t x = x1; x <= x2 && n < (int)sizeof(line) - 2; x++) {
+            bool nw = qzos_raster_get_px(s_frame, s_panel->hor_res, s_panel->ver_res,
+                                          s_panel->strip_h, x, y, &nw) ? nw : false;
+            bool od = false;
+            qzos_raster_get_px(s_written, s_panel->hor_res, s_panel->ver_res,
+                               s_panel->strip_h, x, y, &od);
+            line[n++] = (nw == od) ? '.' : (nw ? '#' : 'o');
+        }
+        if (x2 - x1 + 1 > (int32_t)sizeof(line) - 2) line[n++] = '>';
+        line[n] = '\0';
+        fprintf(stderr, "  y=%3d %s\n", y, line);
+        rows++;
+    }
+}
+
 /* ---- 对外接口 ---- */
 
 int qzos_display_init(void)
@@ -157,6 +203,7 @@ int qzos_display_init(void)
 
     memset(s_frame, 0, sizeof(s_frame));   /* 0 = 无黑像素 = 全白 */
     memset(s_written, 0xFF, sizeof(s_written)); /* 强制首帧走一次落屏 */
+    s_have_written = false;                     /* …但它不是真帧，见 debug_dump_change */
     qzos_dirty_reset(&s_dirty);
     s_need_commit = false;
 
@@ -283,16 +330,28 @@ void qzos_display_commit(void)
 
     if (rc == 0) {
         int32_t dirty_px = qzos_dirty_pixels(&s_dirty);
+        bool dbg = getenv("QZ_DISPLAY_DEBUG") != NULL;
+        qzos_dirty_t rect = s_dirty;   /* reset 之前留一份，给 DEBUG 用 */
+        if (dbg) debug_dump_change(&rect);
         memcpy(s_written, s_frame, sizeof(s_frame));
+        s_have_written = true;
         qzos_dirty_reset(&s_dirty);
         qzos_policy_on_committed(&s_policy, act);
         /* 刷新统计走 stderr 而不是 LV_LOG_*:lv_conf 把日志等级设为 WARN，
-         * 而「这次刷了什么、刷多大」是 e-ink 调参的核心依据，不该被等级屏蔽。 */
-        fprintf(stderr, "qzos-display: commit %s wf=%s dirty=%dpx(%.1f%%) "
-                        "changed=%dB since_full=%d\n",
-                qzos_action_name(act), waveform_name(wf), dirty_px,
+         * 而「这次刷了什么、刷多大」是 e-ink 调参的核心依据，不该被等级屏蔽。
+         * 带毫秒时间戳：分辨一次刷新是"动画逐帧来的"还是"一次性状态跳变"只能
+         * 看时间分布——两者的 changed 字节数可能一模一样。 */
+        fprintf(stderr, "qzos-display: [%6u ms] commit %s wf=%s dirty=%dpx(%.1f%%) "
+                        "changed=%dB since_full=%d",
+                (unsigned)lv_tick_get(), qzos_action_name(act),
+                waveform_name(wf), dirty_px,
                 total > 0 ? 100.0 * (double)dirty_px / (double)total : 0.0,
                 changed, s_policy.commits_since_full);
+        if (dbg)
+            fprintf(stderr, " rect x=%d y=%d w=%d h=%d",
+                    rect.x1, rect.y1, rect.x2 - rect.x1 + 1,
+                    rect.y2 - rect.y1 + 1);
+        fprintf(stderr, "\n");
     } else {
         fprintf(stderr, "qzos-display: commit %s failed (rc=%d)\n",
                 qzos_action_name(act), rc);

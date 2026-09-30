@@ -183,40 +183,74 @@ static void op_create(cJSON *j)
         qzos_bridge_sendf("{\"evt\":\"error\",\"msg\":\"object table full\"}");
         return;
     }
-    /* e-ink 黑白样式：默认主题按钮是灰底（L8=124 < 128 全阈成黑、文字不
-     * 反白）。统一为白底黑字黑框、去圆角/阴影——1bpp 下才有清晰对比。 */
+    /* ---- e-ink 样式：不继承默认主题，自己定死视觉 ----
+     *
+     * 理由不是审美，是三条实测得来的硬事实：
+     *
+     *  1) 1bpp 下主题的视觉语言基本是浪费甚至有害：灰底（L8=124 < 128，会被
+     *     整个阈成黑，文字反而不显）、圆角、阴影、外发光——这些是为了在彩色
+     *     背光屏上营造层次，在只有两色的墨水屏上要么被阈值吃掉，要么白占刷屏
+     *     面积。
+     *  2) **主题的 style transition 让每次点击多刷 3~4 次屏**。按钮挂着
+     *     transition_delayed / transition_normal（TRANSITION_TIME=120ms），
+     *     而 LV_STATE_PRESSED 带 recolor 与 shadow，按下/抬起各触发一段逐帧
+     *     动画 -> 逐帧失效化 -> 逐帧提交。实测按一个**留在屏上**的按钮会多出
+     *     3~4 次提交（相邻两次正好差一个 LV_DEF_REFR_PERIOD，在两种渲染之间
+     *     来回跳），而 1bpp 屏上"按下"与"常态"本来就看不出区别。
+     *     逐个属性去中和（recolor_opa / shadow_width / outline_* /
+     *     transform_*）是打地鼠：主题样式按状态挂在不同 selector 上，漏一个
+     *     就又刷一次，换个 LVGL 版本还会再冒出来。
+     *     诚实说明：**具体是哪一个属性造成的，没有单独隔离出来**——变异测试
+     *     显示"保留 remove_style_all 但把这组属性显式补齐"同样不再抖动，所以
+     *     起作用的是扁平化属性本身。remove_style_all 仍然保留，为的是让
+     *     "不继承为背光屏设计的视觉语言"成为结构性约束，而不是一份要逐条维护
+     *     的属性清单；真正把回归锁住的是 verify-input.sh 的刷新预算断言。
+     *  3) 同理，textarea 光标的 400ms 闪烁（主题的 ta_cursor 样式挂在
+     *     LV_PART_CURSOR|LV_STATE_FOCUSED 上）在 remove_style_all 之后自然
+     *     消失；下面仍然显式把 anim_duration 设 0，作为"光标不许闪"的显式
+     *     声明，免得以后有人又把主题样式加回来。
+     *
+     * 字体不受影响：字体是**继承**属性（从 screen 上的主题继承），移除控件
+     * 自身的样式不会让它退回默认字形。
+     */
+    lv_obj_remove_style_all(obj);
+
+    /* 所有控件共同的基线：白底黑字、无框无角无阴影无 padding。 */
+    lv_obj_set_style_bg_color(obj, lv_color_white(), 0);
+    lv_obj_set_style_bg_opa(obj, LV_OPA_COVER, 0);
+    lv_obj_set_style_text_color(obj, lv_color_black(), 0);
+    lv_obj_set_style_border_width(obj, 0, 0);
+    lv_obj_set_style_radius(obj, 0, 0);
+    lv_obj_set_style_shadow_width(obj, 0, 0);
+    lv_obj_set_style_outline_width(obj, 0, 0);
+    lv_obj_set_style_pad_all(obj, 0, 0);
+
     if (strcmp(type, "btn") == 0) {
-        lv_obj_set_style_bg_color(obj, lv_color_white(), 0);
-        lv_obj_set_style_bg_color(obj, lv_color_white(), LV_STATE_PRESSED);
-        lv_obj_set_style_bg_color(obj, lv_color_white(), LV_STATE_FOCUSED);
-        lv_obj_set_style_text_color(obj, lv_color_black(), 0);
+        /* 按钮是唯一必须"看得见焦点"的控件（键盘导航要告诉用户选中了哪个），
+         * 所以给 1px 黑框。焦点指示用加粗边框而不是颜色变化——1bpp 没有颜色，
+         * 只有黑白粗细之分；也不用主题的 outline_primary（彩色 + 带动画）。 */
         lv_obj_set_style_border_color(obj, lv_color_black(), 0);
         lv_obj_set_style_border_width(obj, 1, 0);
-        lv_obj_set_style_radius(obj, 0, 0);
-        lv_obj_set_style_shadow_width(obj, 0, 0);
-        lv_obj_set_style_shadow_width(obj, 0, LV_STATE_FOCUSED);
         lv_obj_set_style_pad_all(obj, 2, 0);
-    } else {
-        lv_obj_set_style_text_color(obj, lv_color_black(), 0);
-        lv_obj_set_style_bg_color(obj, lv_color_white(), 0);
-        lv_obj_set_style_border_width(obj, 0, 0);
-        lv_obj_set_style_radius(obj, 0, 0);
-        lv_obj_set_style_shadow_width(obj, 0, 0);
-        lv_obj_set_style_pad_all(obj, 0, 0);
+        /* 焦点指示：边框加粗。**两个 state 都要给**——LVGL 只在 group 知道
+         * 自己的 indev 时才追加 LV_STATE_FOCUS_KEY（lv_obj.c 的
+         * LV_EVENT_FOCUSED 分支要看 indev_type），拿不到就只给
+         * LV_STATE_FOCUSED。只写 FOCUS_KEY 的后果是"焦点框看不见"，而在一块
+         * 没有背光、全靠按键导航的墨水屏上，这等于用户不知道选中了哪个。 */
+        lv_obj_set_style_border_color(obj, lv_color_black(), LV_STATE_FOCUSED);
+        lv_obj_set_style_border_width(obj, 2, LV_STATE_FOCUSED);
+        lv_obj_set_style_border_color(obj, lv_color_black(), LV_STATE_FOCUS_KEY);
+        lv_obj_set_style_border_width(obj, 2, LV_STATE_FOCUS_KEY);
     }
     if (strcmp(type, "ta") == 0) {
-        /* 光标不许闪。LVGL 的 textarea 光标是无限循环动画，闪一下就失效化
-         * 一块区域、刷一次屏——在这块 1bpp 墨水屏上等于每半秒一次全屏波形，
-         * 屏幕寿命和电量都撑不住（实测打字时每敲一键刷 4~5 次）。
-         * anim_duration=0 让光标常亮不闪：仍然看得见插入点，但只在它真的
-         * 移动时才产生一次刷新。
-         *
-         * 两个 selector 都要设：默认主题把 400ms 的闪烁挂在
-         * LV_PART_CURSOR|LV_STATE_FOCUSED 上（lv_theme_default.c 的
-         * ta_cursor 样式），只设 LV_PART_CURSOR 会被聚焦态那条盖掉。
-         * 推论：e-ink 宿主上任何 LVGL 动画都是 bug——动画即定时刷屏。 */
+        /* 光标常亮不闪：仍然看得见插入点，但只在它真的移动时才刷一次屏。
+         * 主题移除后 LV_PART_CURSOR 没有任何样式，光标会不可见，所以这里
+         * 显式给它上色。 */
         lv_obj_set_style_anim_duration(obj, 0, LV_PART_CURSOR);
         lv_obj_set_style_anim_duration(obj, 0, LV_PART_CURSOR | LV_STATE_FOCUSED);
+        lv_obj_set_style_border_color(obj, lv_color_black(), LV_PART_CURSOR);
+        lv_obj_set_style_border_width(obj, 1, LV_PART_CURSOR);
+        lv_obj_set_style_bg_color(obj, lv_color_black(), LV_PART_CURSOR);
     }
     if (qzos_input_group() &&
         (strcmp(type, "btn") == 0 || strcmp(type, "ta") == 0 ||

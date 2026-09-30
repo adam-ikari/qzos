@@ -55,6 +55,7 @@ panel        设备 I/O         唯一知道硬件细节的一层
 | `QZ_FULL_EVERY` | `20` | 每 N 次提交做一次全刷清残影（`0` = 只在显式请求时全刷） |
 | `QZ_FAST_THRESHOLD` | `0` | 脏区占比 ≤ N% 时显式要求快速波形（`0` = 禁用，交给驱动选） |
 | `QZ_AUTO_COMMIT` | `1` | `0` = 只在显式 `refresh` op 时提交 |
+| `QZ_DISPLAY_DEBUG` | — | 每次提交多打脏区矩形 + 变化 ASCII 图（`#` 本次变黑 / `o` 变白 / `.` 没变）。查「无缘无故多刷屏」用：只看 `changed` 字节数猜不出来源，看得见形状才知道是哪个控件在动 |
 | `QZ_JS_DIR` | `js` | shell bundle 目录（ui.js / shell.js / apps） |
 | `QZ_APP_DIR` | `/storage` | 用户应用目录（与 `QZ_JS_DIR/apps` 合并扫描，`app.json` 为 manifest） |
 | `QZ_RPC_SOCK` | `/storage/qzos/rpc.sock` | uvrpc 外部 IPC 监听路径（`none` 关闭） |

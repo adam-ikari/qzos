@@ -57,8 +57,12 @@ run() {
   [ -s "$frame" ] || { echo "  (no frame; tail of $log)"; tail -5 "$log"; return 1; }
 }
 
-# 该场景一共向屏提交了几次
-commits() { grep -c "qzos-display: commit" "$OUT/$1.log" || true; }
+# 该场景一共向屏提交了几次。
+# 注意：这是**测量**，所以它本身必须能发现"测量坏了"。曾经把日志格式从
+# "commit ..." 改成 "[123 ms] commit ..." 之后，这个 grep 悄悄匹配不到、
+# 一律返回 0，而断言是"提交次数 <= 上限"，于是 0 永远通过——闸门变成装饰。
+# 所以下面用下限断言兜住：一次启动必须恰好刷 1 次，0 说明测量失效。
+commits() { grep -cE "qzos-display: (\[ *[0-9]+ ms\] )?commit " "$OUT/$1.log" || true; }
 
 same()     { cmp -s "$OUT/$1.pbm" "$OUT/$2.pbm"; }
 differs()  { ! same "$1" "$2"; }
@@ -72,6 +76,10 @@ run app2        "down,enter"            || { echo "FAIL: app2" >&2; exit 1; }
 run back        "down,enter,back"       || { echo "FAIL: back" >&2; exit 1; }
 run type-abc    "down,enter" "a,b,c"    || { echo "FAIL: type-abc" >&2; exit 1; }
 run type-xy     "down,enter" "x,y"      || { echo "FAIL: type-xy" >&2; exit 1; }
+# 按一个**留在屏上**的按钮：这是唯一会渲染出按下/抬起两态的路径，主题动画
+# 的额外刷新全都藏在这里。（桌面上的 enter 立刻 ui.clear() 把按钮销毁，
+# 按下态根本没被画出来，所以 app1/app2 抓不到主题动画的回归。）
+run tap         "enter" "enter"         || { echo "FAIL: tap" >&2; exit 1; }
 
 # ---- 1. 导航：方向键必须真的移动焦点 ----
 # 这条曾经"通过"但什么都没测：早期版本里方向键被原样交给 LVGL，而 v9 的
@@ -106,22 +114,45 @@ else
   bad "typing: typed text did not change the frame at all"
 fi
 
-# ---- 4. e-ink 刷新预算：打字的代价必须是「每个字符一次」 ----
-# 这条挡的是"光标闪烁"这类回归：LVGL 的 textarea 光标是无限循环动画，闪一下
-# 就刷一次屏，在 1bpp 墨水屏上等于每半秒一次全屏波形。实测曾出现每敲一键刷
-# 4~5 次。这里给的是硬上限，不是黄金值。
-budget_check() { # <name> <允许的最大提交数>
-  local got; got=$(commits "$1")
-  if [ "$got" -le "$2" ]; then
-    ok "refresh budget: $1 committed $got times (max $2)"
+# ---- 3b. 系统服务面（uvrpc）：JS 调 sys.info 必须真的回来 ----
+# 覆盖 JSON UI 桥之外的那条腿：postMessage -> bridge op:rpc -> uvrpc INPROC
+# server -> 响应回投 JS -> 界面更新。tap 场景的第二次 enter 就是按 hello 的
+# "sys.info (rpc)" 按钮。
+if differs tap app1; then
+  ok "services: sys.info round trip changed the screen (result rendered)"
+else
+  bad "services: pressing the rpc button changed nothing — the call never came back"
+fi
+
+# ---- 4. e-ink 刷新预算：一次按键最多刷一次屏 ----
+# 这条挡的是"主题动画"与"光标闪烁"两类回归：LVGL 默认主题给按钮挂了 120ms 的
+# style transition，textarea 光标是 400ms 无限循环动画——在 1bpp 墨水屏上，
+# 动画 = 每帧一次波形刷新。实测曾出现每敲一键刷 4~5 次、每点一下按钮多刷 4 次
+# （都是 50ms 一帧地来回跳，在两种渲染之间反复）。
+#
+# 期望值写成"1 + 按键数"而不是魔数：首帧刷 1 次，之后**每个按键至多贡献 1 次**
+# （方向键移焦点 1 次、回车进应用 1 次、每个字符 1 次）。这样写的好处是它直接
+# 表达了 e-ink 的真实约束，而不是把当前 UI 的巧合数字钉死；同时下限检查顺带
+# 兜住"测量失效"——曾经日志格式一改，grep 匹配不到、一律返回 0，而上限断言
+# 让 0 永远通过，闸门直接变成装饰。
+budget() { # <name> <该场景按键数>
+  local keys="$2" want got
+  want=$((keys + 1))
+  got=$(commits "$1")
+  if [ "$got" -eq "$want" ]; then
+    ok "refresh budget: $1 = $got refreshes for $keys keypress(es) (1 + n)"
+  elif [ "$got" -lt "$want" ]; then
+    bad "refresh budget: $1 = $got, want $want — measurement or rendering is broken"
   else
-    bad "refresh budget: $1 committed $got times, max $2 — something is animating"
+    bad "refresh budget: $1 = $got refreshes for $keys keypress(es), want $want — something is animating"
   fi
 }
-# boot=1，enter 进应用=1；type-abc 再加 3 个字符 + 少量余量
-budget_check boot     1
-budget_check app1     2
-budget_check type-abc 7
+budget boot     0   # 只有首帧
+budget app1     1   # enter
+budget app2     2   # down, enter
+budget back     3   # down, enter, back
+budget type-abc 5   # down, enter, a, b, c
+budget tap      2   # enter（进应用）, enter（按留在屏上的按钮）
 
 echo
 echo "  frames: $OUT/*.pbm   logs: $OUT/*.log"
