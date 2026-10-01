@@ -18,8 +18,11 @@
 #include "qzos.h"
 
 #include "appauth.h"
+#include "power.h"
 
 #include <uvrpc.h>
+
+#include <cJSON.h>
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -63,13 +66,197 @@ typedef struct {
     void (*handler)(uvrpc_request_t *req, void *ctx);
 } svc_entry_t;
 
+/* ---- 内置服务：电源域（brain: qzos-power-sim）----
+ *
+ * 这两个方法是 power 决策层第一次真正参与线上判定。在此之前 `qzos_power_may_act`
+ * 只是个纯函数 + 43 条单测，`power` 能力授权了也无服务可调。
+ *
+ * 两个方法都需要 `power` 能力，而 `power` **永不默认授予**（不在任何默认 perms
+ * 里），且需能力的方法一律不上 IPC——所以外部进程碰不到，桌面上的应用也碰不到。
+ */
+
 static void sys_info_handler(uvrpc_request_t *req, void *ctx);
 static void sys_storage_statfs_handler(uvrpc_request_t *req, void *ctx);
+static void sys_power_state_handler(uvrpc_request_t *req, void *ctx);
+static void sys_power_request_handler(uvrpc_request_t *req, void *ctx);
 
+/* 极简 JSON 字符串转义。
+ *
+ * 为什么需要：key_owner_detail 来自 QZ_POWER_OWNER 环境变量，是外部可控的。
+ * 一个未转义的引号就能让整个响应变成非法 JSON，而 JS 侧的 JSON.parse 失败会
+ * 表现成「服务返回了垃圾」——排查时根本想不到是环境变量里的一个引号。 */
+static size_t json_escape(char *dst, size_t cap, const char *src)
+{
+    size_t o = 0;
+    if (!src) { if (cap) dst[0] = '\0'; return 0; }
+    for (const unsigned char *p = (const unsigned char *)src; *p; p++) {
+        char tmp[8];
+        const char *rep = tmp;
+        size_t rl;
+        switch (*p) {
+        case '"':  rep = "\\\""; rl = 2; break;
+        case '\\': rep = "\\\\"; rl = 2; break;
+        case '\n': rep = "\\n";  rl = 2; break;
+        case '\r': rep = "\\r";  rl = 2; break;
+        case '\t': rep = "\\t";  rl = 2; break;
+        default:
+            if (*p < 0x20) { snprintf(tmp, sizeof(tmp), "\\u%04x", *p); rl = 6; }
+            else           { tmp[0] = (char)*p; rl = 1; }
+            break;
+        }
+        if (o + rl + 1 >= cap) break;
+        memcpy(dst + o, rep, rl);
+        o += rl;
+    }
+    if (cap) dst[o] = '\0';
+    return o;
+}
+
+static void sys_power_state_handler(uvrpc_request_t *req, void *ctx)
+{
+    (void)ctx;
+    const qzos_power_t *p = qzos_power_active();
+    qzos_power_state_t st;
+    (void)qzos_power_read(p, &st);
+
+    char detail[256];
+    const char *d = qzos_power_owner_detail(p);
+    if (d && *d) json_escape(detail, sizeof(detail), d);
+    else { detail[0] = '\0'; }
+
+    char buf[1400];
+    int n = 0;
+    n += snprintf(buf + n, sizeof(buf) - (size_t)n,
+                  "{\"backend\":\"%s\",\"present\":%s,\"percent\":%d,"
+                  "\"charging\":%s,\"key_owner\":\"%s\",\"key_owner_detail\":%s%s%s,"
+                  "\"actions\":{",
+                  p->name, st.present ? "true" : "false", st.percent,
+                  st.charging ? "true" : "false",
+                  qzos_power_owner_name(st.owner),
+                  detail[0] ? "\"" : "", detail[0] ? detail : "null",
+                  detail[0] ? "\"" : "");
+
+    /* 把每个动作的「能不能做 + 为什么不能」一起报出去。
+     *
+     * 理由是纯函数 may_act 给的中文串，原样透出。少了这一段，shell 只能显示
+     * 一个不能按的按钮，用户无从知道「电源键归属未确认」——而那恰恰是闸门 0
+     * 最需要被看见的东西。 */
+    static const struct { const char *name; qzos_power_action_t act; } acts[] = {
+        { "suspend",  QZOS_PWR_SUSPEND  },
+        { "shutdown", QZOS_PWR_SHUTDOWN },
+        { "reboot",   QZOS_PWR_REBOOT   },
+    };
+    for (unsigned i = 0; i < sizeof(acts) / sizeof(acts[0]); i++) {
+        const char *why = NULL;
+        bool may = qzos_power_may_act(p, acts[i].act, &why);
+        char whybuf[256];
+        if (why && *why) json_escape(whybuf, sizeof(whybuf), why);
+        else { whybuf[0] = '\0'; }
+        n += snprintf(buf + n, sizeof(buf) - (size_t)n,
+                      "%s\"%s\":{\"allowed\":%s,\"reason\":%s%s%s}",
+                      i ? "," : "", acts[i].name,
+                      may ? "true" : "false",
+                      whybuf[0] ? "\"" : "", whybuf[0] ? whybuf : "null",
+                      whybuf[0] ? "\"" : "");
+    }
+    n += snprintf(buf + n, sizeof(buf) - (size_t)n, "}}");
+    uvrpc_request_send_response(req, UVRPC_OK, (const uint8_t *)buf, (size_t)n);
+}
+
+static void sys_power_request_handler(uvrpc_request_t *req, void *ctx)
+{
+    (void)ctx;
+    /* 先自己判一次，为的是把中文理由带回 JS。qzos_power_request 内部还会再判
+     * 一次（defense in depth），所以这里判了不等于能省掉它那一次。 */
+    const qzos_power_t *p = qzos_power_active();
+
+    /* 动作名拷进本地缓冲，**不能**留 cJSON 的 valuestring 指针。
+     *
+     * valuestring 指向解析树内部，紧接着 cJSON_Delete(j) 就把它释放了。
+     * 症状是「action 里出现二进制垃圾」，而更糟的是那段垃圾会被原样 json_escape
+     * 后**塞进响应体**——于是 host 收到非法 JSON，走 bad-json 路径把 JS 引擎
+     * 打死（`[js] engine error: bad-json`）。一个 use-after-free 表现为
+     * 「引擎崩溃」，排查时根本想不到是几十行外的一个指针。 */
+    char act_buf[32];
+    const char *act_name = NULL;
+    size_t alen = 0;
+    if (req->params && req->params_size > 0) {
+        char pbuf[256];
+        size_t m = req->params_size < sizeof(pbuf) - 1 ? req->params_size : sizeof(pbuf) - 1;
+        memcpy(pbuf, req->params, m);
+        pbuf[m] = '\0';
+        cJSON *j = cJSON_Parse(pbuf);
+        if (j) {
+            cJSON *a = cJSON_GetObjectItem(j, "action");
+            if (cJSON_IsString(a) && a->valuestring) {
+                size_t l = strlen(a->valuestring);
+                if (l < sizeof(act_buf)) {
+                    memcpy(act_buf, a->valuestring, l + 1);
+                    act_name = act_buf;
+                    alen = l;
+                }
+                /* 超过缓冲 ⇒ 视作「没有这个参数」而不是截断后当合法动作名。
+                 * 截断会把 "shutdownXXXX" 变成 "shutdown" 然后真的去关机。 */
+            }
+            cJSON_Delete(j);
+        }
+    }
+    /* 本 handler 的三种结局**全部**用 UVRPC_OK + body 里的 ok 布尔表达，
+     * 不用传输层错误码。理由：ui.rpc 只在传输故障时 reject，而
+     * rpc_cb 的失败分支会**丢掉响应体**（只报 "rpc status N"）。若把
+     * 「动作名拼错了」映射成传输错误，调用方拿到的就是一句无信息的话。
+     *
+     * 规矩因此是：**格式正确的提问永远 resolve，答案在 body.ok；reject 只留给
+     * 真正的传输故障。** 授权拒绝（op_rpc 那道）与本处的 refused 是同一族——
+     * 拒绝是正常回执，不是故障。 */
+    if (!act_name) {
+        const char *e = "{\"ok\":false,\"error\":\"need action\","
+                        "\"expected\":\"suspend|shutdown|reboot\"}";
+        uvrpc_request_send_response(req, UVRPC_OK, (const uint8_t *)e, strlen(e));
+        return;
+    }
+
+    qzos_power_action_t act;
+    if      (alen == 7 && memcmp(act_name, "suspend",  7) == 0) act = QZOS_PWR_SUSPEND;
+    else if (alen == 8 && memcmp(act_name, "shutdown", 8) == 0) act = QZOS_PWR_SHUTDOWN;
+    else if (alen == 6 && memcmp(act_name, "reboot",   6) == 0) act = QZOS_PWR_REBOOT;
+    else {
+        /* 未知动作名要**明确**区分于「已知但被拒」。前者是调用方拼错了，后者是
+         * 归属/权限不允许——两者排查方向完全不同，混成一个回执就查不动了。 */
+        char e[192];
+        char safe[64];
+        json_escape(safe, sizeof(safe), act_name);
+        snprintf(e, sizeof(e),
+                 "{\"ok\":false,\"error\":\"unknown action\",\"action\":\"%s\"}", safe);
+        uvrpc_request_send_response(req, UVRPC_OK, (const uint8_t *)e, strlen(e));
+        return;
+    }
+
+    const char *why = NULL;
+    if (!qzos_power_may_act(p, act, &why)) {
+        char e[384];
+        char safe[256];
+        json_escape(safe, sizeof(safe), why ? why : "(no reason)");
+        snprintf(e, sizeof(e),
+                 "{\"ok\":false,\"error\":\"refused\",\"action\":\"%s\","
+                 "\"reason\":\"%s\"}",
+                 qzos_power_action_name(act), safe);
+        uvrpc_request_send_response(req, UVRPC_OK, (const uint8_t *)e, strlen(e));
+        return;
+    }
+
+    int rc = qzos_power_request(p, act);
+    char e[128];
+    snprintf(e, sizeof(e), "{\"ok\":%s,\"action\":\"%s\",\"rc\":%d}",
+             rc == 0 ? "true" : "false", qzos_power_action_name(act), rc);
+    uvrpc_request_send_response(req, UVRPC_OK, (const uint8_t *)e, strlen(e));
+}
 static const svc_entry_t s_registered[] = {
-    /* 方法名          所需能力     handler */
-    { "sys.info",      NULL,        sys_info_handler },
-    { "sys.storage.statfs", "storage", sys_storage_statfs_handler },
+    /* 方法名                 所需能力     handler */
+    { "sys.info",             NULL,        sys_info_handler },
+    { "sys.storage.statfs",   "storage",   sys_storage_statfs_handler },
+    { "sys.power.state",      "power",     sys_power_state_handler },
+    { "sys.power.request",    "power",     sys_power_request_handler },
 };
 #define N_REGISTERED ((int)(sizeof(s_registered) / sizeof(s_registered[0])))
 

@@ -15,7 +15,11 @@ BD=${BD:-build-os-mips}
 [ -x "$QEMU" ] || { echo "missing $QEMU — run scripts/fetch-tools.sh" >&2; exit 1; }
 
 OUT=$(mktemp -d)
-trap 'rm -rf "$OUT"' EXIT
+trap 'hz_stop; rm -rf "$OUT"' EXIT
+
+HZ_HOST="$BD/qzos-host"
+. os/test/hostlib.sh
+HZ_FIFO_DIR="$OUT"
 pass=0; fail=0
 ok()  { echo "  PASS  $*"; pass=$((pass+1)); }
 bad() { echo "  FAIL  $*"; fail=$((fail+1)); }
@@ -28,20 +32,25 @@ exec $PWD/$QEMU -0 "\$0" "$PWD/$BD/qzjs-rt" "\$@"
 EOF
 chmod +x "$OUT/qzjs-rt.sh"
 
-run_mips() {  # run_mips <name> <app_dir> [keys]
-  local name="$1" appdir="$2" keys="${3:-}"
-  local fifo="$OUT/$name.fifo" frame="$OUT/$name.pbm" log="$OUT/$name.log"
-  rm -f "$fifo" "$frame" "$log"; mkfifo "$fifo"
-  ( QZ_DISPLAY=pbm QZ_PBM="$frame" QZ_RPC_SOCK=none QZ_JS_DIR=os/js \
-    QZ_APP_DIR="$appdir" QZ_RT_SERVER="$OUT/qzjs-rt.sh" \
-    QZ_AUTOEXIT_S=9 QZ_INPUT0="$fifo" QZ_INPUT1= \
-    "$QEMU" "$PWD/$BD/qzos-host" >"$log" 2>&1 ) &
-  local pid=$!
-  if [ -n "$keys" ]; then
-    sleep 3
-    python3 os/test/replay-keys.py --arch mips32 --script "$keys" --out "$fifo"
+# qemu-user 下比原生慢一个数量级，所以超时一律放宽到 3 倍。宁可慢，不可脆。
+run_mips() {  # run_mips <name> <app_dir> [keys] [settle_ms]
+  local name="$1" appdir="$2" keys="${3:-}" settle="${4:-2500}"
+  local frame="$OUT/$name.pbm" log="$OUT/$name.log"
+  rm -f "$frame" "$log"
+  hz_set_cmd "$QEMU" "$PWD/$BD/qzos-host"
+  hz_start "$log" QZ_DISPLAY=pbm QZ_PBM="$frame" QZ_RPC_SOCK=none QZ_JS_DIR=os/js \
+           QZ_APP_DIR="$appdir" QZ_RT_SERVER="$OUT/qzjs-rt.sh" QZ_AUTOEXIT_S=25
+  if ! hz_wait_desktop 40; then
+    echo "no desktop commit for $name" >&2; tail -8 "$log" >&2; hz_stop; return 1
   fi
-  wait "$pid" 2>/dev/null || true
+  if [ -n "$keys" ]; then
+    python3 os/test/replay-keys.py --arch mips32 --script "$keys" --out "$(hz_fifo)" >/dev/null 2>&1
+    hz_wait_stable "$log" "$settle" 25 || true
+  else
+    # 不按键的场景：等 shell 报出应用数，那行是「发现阶段完成」的标志
+    hz_wait 'apps' 40 || true
+  fi
+  hz_stop
   [ -s "$frame" ] || { echo "no frame for $name" >&2; tail -8 "$log" >&2; return 1; }
 }
 
@@ -122,15 +131,19 @@ cat > "$JS2/apps/bp/app.js" <<'EOF'
 console.log('BUILTIN perms=' + JSON.stringify(api.perms));
 EOF
 run_mips builtin "$OUT/empty" "" 2>/dev/null || true
-FIFO="$OUT/builtin.fifo"; rm -f "$FIFO"; mkfifo "$FIFO"
-( QZ_DISPLAY=pbm QZ_PBM="$OUT/bp.pbm" QZ_RPC_SOCK=none QZ_JS_DIR="$JS2" \
-  QZ_APP_DIR="$OUT/empty" QZ_RT_SERVER="$OUT/qzjs-rt.sh" \
-  QZ_AUTOEXIT_S=9 QZ_INPUT0="$FIFO" QZ_INPUT1= \
-  "$QEMU" "$PWD/$BD/qzos-host" >"$OUT/bp.log" 2>&1 ) &
-BP=$!
-sleep 4
-python3 os/test/replay-keys.py --arch mips32 --script enter --out "$FIFO"
-wait "$BP" 2>/dev/null || true
+hz_set_cmd "$QEMU" "$PWD/$BD/qzos-host"
+hz_start "$OUT/bp.log" QZ_DISPLAY=pbm QZ_PBM="$OUT/bp.pbm" QZ_RPC_SOCK=none \
+         QZ_JS_DIR="$JS2" QZ_APP_DIR="$OUT/empty" \
+         QZ_RT_SERVER="$OUT/qzjs-rt.sh" QZ_AUTOEXIT_S=25
+if hz_wait_desktop 40; then
+  python3 os/test/replay-keys.py --arch mips32 --script enter --out "$(hz_fifo)" >/dev/null 2>&1
+  # 哨兵 = 应用自己打的那行。回执没到就停机的话，判据读的是残缺日志——
+  # 而「没读到」很容易被读成「没拿到 perms」。
+  hz_wait 'BUILTIN perms=' 40 || true
+else
+  bad "MIPS 授权探针那次运行没到桌面"
+fi
+hz_stop
 if grep -q 'BUILTIN perms=\["info"\]' "$OUT/bp.log"; then
   ok "MIPS 上内置应用拿到 perms（fail-closed 没有一刀切）"
 else

@@ -20,11 +20,24 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-HOST=${HOST:-build-os/qzos-host}
-[ -x "$HOST" ] || { echo "missing $HOST — run scripts/build-os.sh" >&2; exit 1; }
+HZ_HOST=${HOST:-build-os/qzos-host}
+[ -x "$HZ_HOST" ] || { echo "missing $HZ_HOST — run scripts/build-os.sh" >&2; exit 1; }
+
+# 启停用共享 helper：等判据出现就停，而不是等 QZ_AUTOEXIT_S 走完。
+# 2 次运行 × 9s = 18s，而实际工作只有每次 ~2.5s 的开机。
+. os/test/hostlib.sh
+HZ_REPLAY=os/test/replay-keys.py
+HZ_ARCH=x86_64
+HZ_FIFO_DIR=""
 
 OUT=$(mktemp -d)
-trap 'rm -rf "$OUT"' EXIT
+HZ_FIFO_DIR="$OUT"
+# 调试时留住临时目录：判据匹配不到时，排查完全依赖日志本身。
+if [ "${QZ_KEEP_TMP:-0}" = "1" ]; then
+  trap 'echo "tmp kept: $OUT"' EXIT
+else
+  trap 'rm -rf "$OUT"' EXIT
+fi
 JS2="$OUT/js2"
 pass=0; fail=0
 ok()  { echo "  PASS  $*"; pass=$((pass+1)); }
@@ -61,7 +74,7 @@ function probe(tag, then) {
 ui.setApp('escaper', ['storage']);           /* 给自己加能力 */
 probe('P1 ESCALATE-SELF', function () {
   ui.setApp('imposter', ['storage']);        /* 点名一个 id 与目录名不符的目录 */
-  probe('P2 IMPOSTER-NAMED');
+  probe('P2 IMPOSTER-NAMED', function () { console.log('ALLDONE'); });
 });
 EOF
 
@@ -71,7 +84,8 @@ ui.setApp('liar', []);                        /* 磁盘有 storage，消息说�
 ui.rpc('sys.storage.statfs', {}).then(
   function (r) { console.log('P3 DISK-AUTHORITY ALLOWED mounts=' +
                               (r && r.mounts ? r.mounts.length : '?')); },
-  function () { console.log('P3 DISK-AUTHORITY DENIED'); });
+  function () { console.log('P3 DISK-AUTHORITY DENIED'); })
+  .then(function () { console.log('ALLDONE'); });
 EOF
 
 # run_app <行号>：桌面按目录名排序，焦点从第 1 行起（escaper=1 · liar=2；
@@ -81,25 +95,39 @@ EOF
 # 行号是显式参数，不靠想当然。另外 replay-keys 的脚本分隔符是**逗号**
 # （--help: "down,down,enter"），写成空格会变成一个没人认识的名字、一个键都不发，
 # 而这跟「应用没启动」在日志里长得一样。
+# run_app <行号>：桌面按目录名排序，焦点从第 1 行起（escaper=1 · liar=2；
+# imposter 不可列，所以不占行）。
+#
+# 曾经写成「一律按 1 次 enter」——测 liar 时其实 launch 的是 escaper，正对照假失败。
+# 行号是显式参数，不靠想当然。另外 replay-keys 的脚本分隔符是**逗号**
+# （--help: "down,down,enter"），写成空格会变成一个没人认识的名字、一个键都不发，
+# 而这跟「应用没启动」在日志里长得一样。
 run_app() {
-  local row="$1" log="$2" tag="$3"
-  local F="$OUT/fifo.$tag"; mkfifo "$F"
-  ( QZ_DISPLAY=pbm QZ_PBM="$OUT/$tag.pbm" QZ_RPC_SOCK=none \
-    QZ_JS_DIR="$JS2" QZ_APP_DIR="$OUT/empty" QZ_AUTOEXIT_S=9 \
-    QZ_INPUT0="$F" QZ_INPUT1= "$HOST" >"$log" 2>&1 ) &
-  local pid=$!
-  sleep 2.5
+  local row="$1" log="$2" tag="$3" waitfor="$4"
+  hz_start "$log" QZ_DISPLAY=pbm QZ_PBM="$OUT/$tag.pbm" QZ_RPC_SOCK=none \
+           QZ_JS_DIR="$JS2" QZ_APP_DIR="$OUT/empty" QZ_AUTOEXIT_S=20
+  if ! hz_wait_desktop 15; then
+    bad "宿主没提交桌面首帧就退出了（日志见 $log）"
+    hz_stop
+    return 1
+  fi
+  # shell: down 移动焦点，enter 启动。行号=1 时不需要 down。
   local script=""
   if [ "$row" -gt 1 ]; then
     for _ in $(seq 2 "$row"); do script="${script}down,"; done
   fi
   script="${script}enter"
-  python3 os/test/replay-keys.py --arch x86_64 --script "$script" --out "$F" >/dev/null 2>&1
-  wait "$pid" 2>/dev/null || true
+  hz_keys "$script"
+  if ! hz_wait "$waitfor" 15; then
+    bad "等不到判据行 /$waitfor/（见 $log）"
+    hz_stop
+    return 1
+  fi
+  hz_stop
 }
 
-run_app 1 "$OUT/escaper.log" escaper
-run_app 2 "$OUT/liar.log"    liar
+run_app 1 "$OUT/escaper.log" escaper 'ALLDONE'
+run_app 2 "$OUT/liar.log"    liar     'ALLDONE'
 
 # ---- 桌面本身：id 不符的包不该被列出来（JS 侧；C 侧另有 P2）----
 if grep -q "app 'imposter' authorized" "$OUT/liar.log"; then

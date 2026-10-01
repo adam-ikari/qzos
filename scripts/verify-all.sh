@@ -24,6 +24,9 @@ bash scripts/test-keymap.sh
 step "power domain decision layer (pure, no device)"
 bash scripts/test-power.sh
 
+step "power service on the service plane (owner-unknown = refuse, fake sysfs)"
+bash scripts/test-power-service.sh
+
 step "system-service registry (the only JS->C boundary)"
 bash scripts/test-services.sh
 

@@ -22,12 +22,23 @@ set -euo pipefail
 # 本脚本在 os/test/ 下，要上溯两级才到仓库根（build-os/、scripts/ 都在那）。
 cd "$(dirname "$0")/../.."
 
-HOST=${HOST:-build-os/qzos-host}
-[ -x "$HOST" ] || { echo "missing $HOST — run scripts/build-os.sh" >&2; exit 1; }
+HZ_HOST=${HOST:-build-os/qzos-host}
+[ -x "$HZ_HOST" ] || { echo "missing $HZ_HOST — run scripts/build-os.sh" >&2; exit 1; }
+
+# 启停用共享 helper：等判据出现就停，而不是等 QZ_AUTOEXIT_S 走完。
+# 8 次运行 × 9s = 72s，而实际工作只有每次 ~2.5s 的开机。
+. os/test/hostlib.sh
+HZ_REPLAY=os/test/replay-keys.py
+HZ_ARCH=x86_64
 VIEW="python3 os/test/pbm_view.py"
 
 OUT=$(mktemp -d)
-trap 'rm -rf "$OUT"' EXIT
+HZ_FIFO_DIR="$OUT"
+if [ "${QZ_KEEP_TMP:-0}" = "1" ]; then
+  trap 'hz_stop; echo "tmp kept: $OUT"' EXIT
+else
+  trap 'hz_stop; rm -rf "$OUT"' EXIT
+fi
 pass=0; fail=0
 ok()  { echo "  PASS  $*"; pass=$((pass+1)); }
 bad() { echo "  FAIL  $*"; fail=$((fail+1)); }
@@ -78,21 +89,49 @@ REPLAY=${REPLAY:-os/test/replay-keys.py}
 # 被执行」，必须真的把焦点移到它并回车——只截桌面帧是测不到执行与否的。
 # 按键走 FIFO + replay-keys.py（struct input_event 的布局随架构不同，--arch
 # 必须显式声明消费者架构，见 verify-input.sh 的注释）。
+# run_desk <app_dir> <name> <keys> <mode>
+#
+# mode = newcommit  按键后期望画面变化 → 等提交次数 +1，一出现就停
+# mode = <秒数>     按键后期望**没有**变化（nav_stay / slowboot 就是在测这个）
+#                   → 给固定沉降后停。这两个用例没法用「等新提交」：它们断言的
+#                   恰恰是「什么都没发生」，所以必须留出一段够 LVGL 刷几帧的时间。
+#                   沉降从原来的 ~6.5s 收到 2.5s —— 一次重绘只需几个 LVGL tick
+#                   （每 tick 33ms），6.5s 是「不敢早停」而不是「需要那么久」。
 run_desk() {
-  local appdir="$1" name="$2" keys="${3:-}"
-  local fifo="$OUT/$name.fifo" frame="$OUT/$name.pbm" log="$OUT/$name.log"
-  rm -f "$fifo" "$frame" "$log"
-  mkfifo "$fifo"
-  ( QZ_DISPLAY=pbm QZ_PBM="$frame" QZ_RPC_SOCK=none QZ_JS_DIR=os/js \
-    QZ_APP_DIR="$appdir" QZ_AUTOEXIT_S=9 QZ_INPUT0="$fifo" QZ_INPUT1= \
-    "$HOST" >"$log" 2>&1 ) &
-  local pid=$!
-  if [ -n "$keys" ]; then
-    # 延时要够桌面把应用扫完并渲染出来（与 verify-input.sh 同量级）
-    sleep 2.5
-    python3 "$REPLAY" --arch x86_64 --script "$keys" --out "$fifo"
+  local appdir="$1" name="$2" keys="${3:-}" mode="${4:-newcommit}"
+  shift 4 2>/dev/null || shift $#
+  # 第 5 个参数起是额外的 KEY=VAL，显式透传。
+  # 不用 `QZ_TEST_SHELL_DELAY_MS=600 run_desk ...` 那种写法：那依赖 bash 对
+  # **函数**赋值的导出语义（POSIX 允许它在调用后残留），而 hz_start 是用
+  # `env KEY=VAL ...` 显式构造环境的，中间少一层传导就静默丢变量——而丢了
+  # QZ_TEST_SHELL_DELAY_MS 只会让那条用例慢路径不再被触发，测试照样全绿。
+  local extra=()
+  while [ $# -gt 0 ]; do extra+=("$1"); shift; done
+  local frame="$OUT/$name.pbm" log="$OUT/$name.log"
+  rm -f "$frame" "$log"
+  hz_start "$log" QZ_DISPLAY=pbm QZ_PBM="$frame" QZ_RPC_SOCK=none \
+           QZ_JS_DIR=os/js QZ_APP_DIR="$appdir" QZ_AUTOEXIT_S=20 "${extra[@]}"
+  if ! hz_wait_desktop 15; then
+    echo "no desktop commit for $name; log:" >&2; tail -20 "$log" >&2; hz_stop; exit 1
   fi
-  wait "$pid" || true
+  if [ -n "$keys" ]; then
+    # 按键前的提交数：用来判「按键后有没有新的一帧」
+    local before; before=$(hz_commits "$log")
+    # 用 hz_start 建的那个 FIFO，不是自己另建的
+    python3 "$REPLAY" --arch x86_64 --script "$keys" --out "$(hz_fifo)" >/dev/null 2>&1
+    if [ "$mode" = "newcommit" ]; then
+      # 等画面**静止**，不等「按键数 +1」：一次按键可能不产生变化，也可能产生
+      # 多次提交（实测 down,down,enter = 桌面 / 焦点移动 / 应用绘制 三次）。
+      # 按 +1 等会在焦点移动那帧就停机，抓到桌面帧。
+      if ! hz_wait_stable "$log" 700 10; then
+        echo "screen never settled for $name; log:" >&2; tail -20 "$log" >&2
+        hz_stop; exit 1
+      fi
+    else
+      sleep "$mode"
+    fi
+  fi
+  hz_stop
   [ -s "$frame" ] || { echo "no frame for $name; log:" >&2; tail -20 "$log" >&2; exit 1; }
 }
 
@@ -185,7 +224,7 @@ fi
 # 与 verify-input.sh / verify-rt-recovery.sh 踩的是同一个坑（同一个仓库里第
 # 三次），所以这里的注释写得很啰嗦——第四次不该再有人踩。
 commits() { grep -cE "qzos-display: (\[ *[0-9]+ ms\] )?commit " "$1" 2>/dev/null || true; }
-run_desk "$OUT/apps" nav_stay "back"
+run_desk "$OUT/apps" nav_stay "back" 2.5
 stay_n=$(commits "$OUT/nav_stay.log")
 if [ "${stay_n:-99}" -le 1 ]; then
   ok "桌面态按 back 不重绘（提交 ${stay_n} 次，只有启动那一帧）"
@@ -203,7 +242,7 @@ fi
 #
 # 所以断言必须**确定性地**制造慢路径，不能指望 CI 机器够慢。用
 # QZ_TEST_SHELL_DELAY_MS 在 boot 脚本里插一个延时，逼出撞车。
-QZ_TEST_SHELL_DELAY_MS=600 run_desk "$OUT/apps" slowboot "back"
+run_desk "$OUT/apps" slowboot "back" 2.5 QZ_TEST_SHELL_DELAY_MS=600
 slow_n=$(commits "$OUT/slowboot.log")
 # 必须**恰好** 1 次：写成 "<= 1" 的话，0 次也会通过，而 0 次意味着桌面根本没
 # 落屏（比白刷一次更糟）。这个弱断言是我第一版的写法，被自己的测试数据顶回来
@@ -245,29 +284,39 @@ cat > "$JS2/apps/pkg/app.js" <<'EOF'
  * 两个调用必须**同时**发出：宿主只认「此刻的活动应用」，串行等第一个的结果
  * 再发第二个，中间插入的其它消息会改掉上下文。 */
 console.log('PERMS=' + JSON.stringify(api.perms));
-ui.rpc('sys.info', {}).then(function (r) {
+var a = ui.rpc('sys.info', {}).then(function (r) {
   console.log('INFO ALLOWED ' + (r && r.service ? r.service : '?'));
 }, function () { console.log('INFO DENIED'); });
 /* 探一个**已注册但需要 storage 能力**的方法。原先探的是 'sys.storage'，
  * 那个方法并不在注册表内——于是被拒的理由是「服务不存在」而不是「能力不足」，
  * 判据因此变弱：实现只要「凡是 storage 相关就拒」就能过，哪怕授权完全坏了。
  * 探一个真实存在的方法，才能验出「同一应用、只差一个能力」的边界。 */
-ui.rpc('sys.storage.statfs', {}).then(function () {
+var b = ui.rpc('sys.storage.statfs', {}).then(function () {
   console.log('STORAGE ALLOWED');
 }, function (e) { console.log('STORAGE DENIED ' + JSON.stringify(e.message || e)); });
+
+/* 哨兵：两条都回来之后才打。回执顺序不保证，拿「第一条」当哨兵会提前停机
+ * 把第二条的回执丢掉（见 os/test/hostlib.sh 顶上那段）。 */
+Promise.all([a, b]).then(function () { console.log('PERMDONE'); });
 EOF
 
 # QZ_JS_DIR 指到 $JS2（只有 pkg 一个内置应用），所以焦点在第 1 行，enter 即中。
 perm_frame="$OUT/perm.pbm"
 perm_log="$OUT/perm.log"
-F="$OUT/perm.fifo"; mkfifo "$F"
-( QZ_DISPLAY=pbm QZ_PBM="$perm_frame" QZ_RPC_SOCK=none QZ_JS_DIR="$JS2" \
-  QZ_APP_DIR="$OUT/empty" QZ_AUTOEXIT_S=9 QZ_INPUT0="$F" QZ_INPUT1= \
-  "$HOST" >"$perm_log" 2>&1 ) &
-PP=$!
-sleep 2.5
-python3 "$REPLAY" --arch x86_64 --script enter --out "$F"
-wait "$PP" || true
+hz_start "$perm_log" QZ_DISPLAY=pbm QZ_PBM="$perm_frame" QZ_RPC_SOCK=none \
+         QZ_JS_DIR="$JS2" QZ_APP_DIR="$OUT/empty" QZ_AUTOEXIT_S=20
+if ! hz_wait_desktop 15; then
+  bad "授权探针那次运行没到桌面（日志见 $perm_log）"
+else
+  hz_keys enter
+  # 哨兵 = 探针自己打的一行。两个调用同时发出，回执顺序不保证，所以让应用
+  # 用计数表明「两条都回来了」——早先拿「第一条回执」当哨兵会提前停机，
+  # 把第二条的回执丢掉（见 hostlib.sh 顶上那段）。
+  if ! hz_wait 'PERMDONE' 15; then
+    bad "授权探针没跑完两条调用（日志见 $perm_log）"
+  fi
+fi
+hz_stop
 
 denied_n=$(grep -c "STORAGE DENIED" "$perm_log" 2>/dev/null || true)
 leaked_n=$(grep -c "STORAGE ALLOWED" "$perm_log" 2>/dev/null || true)

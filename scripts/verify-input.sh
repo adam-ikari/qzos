@@ -15,14 +15,23 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-HOST="${HOST:-$PWD/build-os/qzos-host}"
+HZ_HOST="${HOST:-$PWD/build-os/qzos-host}"
+HZ_REPLAY=os/test/replay-keys.py
+HZ_ARCH=x86_64
 REPLAY="python3 os/test/replay-keys.py"
-AUTOEXIT_S="${AUTOEXIT_S:-8}"
-KEY_DELAY_S="${KEY_DELAY_S:-2.5}"
+# AUTOEXIT_S 只是**超时兜底**。早先每次运行都老老实实等它走完（8s），而实测
+# 每个场景只有 4 段按键 × 2.5s 沉降 = 10s 里的前几秒在做事，其余空转。
+# 现在改成：等画面静止就停（hz_wait_stable），AUTOEXIT 退成看门狗。
+AUTOEXIT_S="${AUTOEXIT_S:-20}"
+# 段与段之间的沉降：原来固定 2.5s。这里改成「等画面静止」（下限 0.4s），
+# 段与段之间必须留时间是因为同一段按键可能产生多次提交。
+HZ_FIFO_DIR=""
+. os/test/hostlib.sh
 OUT=/tmp/qzos-input
 mkdir -p "$OUT"
+HZ_FIFO_DIR="$OUT"
 
-[ -x "$HOST" ] || { echo "missing $HOST — run scripts/build-os.sh" >&2; exit 1; }
+[ -x "$HZ_HOST" ] || { echo "missing $HZ_HOST — run scripts/build-os.sh" >&2; exit 1; }
 
 pass=0; fail=0
 ok()  { echo "  PASS  $*"; pass=$((pass+1)); }
@@ -31,29 +40,28 @@ bad() { echo "  FAIL  $*"; fail=$((fail+1)); }
 # run <name> <key-script> [key-script ...]  多段脚本会依次投放（等上一段跑完）
 run() {
   local name=$1; shift
-  local fifo="$OUT/$name.fifo" frame="$OUT/$name.pbm" log="$OUT/$name.log"
-  rm -f "$fifo" "$frame" "$log"
-  mkfifo "$fifo"
-
-  ( QZ_DISPLAY=pbm QZ_PBM="$frame" QZ_RPC_SOCK=none \
-    QZ_AUTOEXIT_S="$AUTOEXIT_S" QZ_JS_DIR=os/js QZ_APP_DIR=os/js/apps \
-    QZ_INPUT0="$fifo" QZ_INPUT1= \
-    "$HOST" >"$log" 2>&1 ) &
-  local pid=$!
+  local frame="$OUT/$name.pbm" log="$OUT/$name.log"
+  rm -f "$frame" "$log"
+  hz_start "$log" QZ_DISPLAY=pbm QZ_PBM="$frame" QZ_RPC_SOCK=none \
+           QZ_AUTOEXIT_S="$AUTOEXIT_S" QZ_JS_DIR=os/js QZ_APP_DIR=os/js/apps
+  if ! hz_wait_desktop 15; then
+    echo "  (no desktop commit; tail of $log)"; tail -5 "$log"; hz_stop; return 1
+  fi
 
   local script
   for script in "$@"; do
     if [ -n "$script" ]; then
-      sleep "$KEY_DELAY_S"
       # --arch 是必须的：struct input_event 的大小随架构不同（x86_64=24、
       # mips32=16，差在 timeval 里的 time_t 宽度），喂错布局会被静默切成
       # 垃圾事件——测试"通过"而什么也没测。
-      $REPLAY --arch x86_64 --script "$script" --out "$fifo"
+      $REPLAY --arch x86_64 --script "$script" --out "$(hz_fifo)"
+      # 段与段之间必须等画面静止：同一段按键可能产生多次提交
+      # （实测 down,down,enter = 桌面 / 焦点移动 / 应用绘制）。
+      hz_wait_stable "$log" 500 10 || true
     fi
   done
 
-  wait "$pid" || true
-  rm -f "$fifo"
+  hz_stop
   [ -s "$frame" ] || { echo "  (no frame; tail of $log)"; tail -5 "$log"; return 1; }
 }
 

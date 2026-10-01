@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [power, suspend, shutdown, simulator, gate0]
 created: "2026-09-30T12:27:12"
-updated: "2026-09-30T12:27:29"
+updated: "2026-10-01T06:30:28"
 ---
 
 <!-- compiled_truth -->
@@ -110,3 +110,9 @@ P5 需人（熄屏后按键实按）。
   summary: "闸门自身出过一次真事故且被抓到：test_power.c 的 ok() 只把失败名记进数组、漏了 failed++，导致结尾 if (failed==0) printf(\"OK\") 永远走真——把「未知归属全拒」那条核心不变量从 power.c 删掉，43 条断言照样全绿。修好后 4 个 mutant 全红。教训：判据要能发现自己坏了，与「回执层面的断言不能替代效果层面的断言」同病；且这条是在闸门刚写出来、还没被信任时抓到的，不是等到某天怀疑"
   source: "brain append-timeline：变异测试"
   affects: [qzos-power-sim, port-verification]
+
+- time: 2026-10-01T06:30:28
+  kind: evidence
+  summary: "电源决策层第一次真正参与线上判定：新增 sys.power.state / sys.power.request，两者都要 power 能力（永不默认授予，且需能力的方法一律不上 IPC）。state 把每个动作的 allowed + 中文理由一起报出去，这样 shell 能显示「为什么按不动关机」——而那正是闸门 0 最需要被看见的东西。request 的三种结局（成功 / 归属未确认被拒 / 动作名拼错）**全部**用 UVRPC_OK + body 里的 ok 布尔表达，reject 只留给真正的传输故障；因为 rpc_cb 的失败分支会丢掉响应体，把「拼错了」映射成传输错误的话调用方只拿到一句无信息的话。新增 scripts/test-power-service.sh（15 断言）：无 power 能力被拒 / 有能力但归属未确认被拒且理由带回 JS / 归属确认后假 sysfs 里真的被写（正对照）。写目标全在临时目录，绝不碰真机 sysfs（P3/P4 未验）"
+  source: brain append-timeline
+  affects: [qzos-power-sim, qzos-service-boundary]

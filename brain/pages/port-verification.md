@@ -5,7 +5,7 @@ category: project
 status: active
 tags: [verification, device, perf]
 created: "2026-09-29T00:51:32"
-updated: "2026-09-30T04:20:31"
+updated: "2026-10-01T06:30:20"
 ---
 
 <!-- compiled_truth -->
@@ -159,3 +159,15 @@ updated: "2026-09-30T04:20:31"
   summary: Rewrote compiled_truth to the new best understanding
   source: brain update-truth
   affects: [port-verification]
+
+- time: 2026-10-01T06:30:20
+  kind: evidence
+  summary: "闸门墙钟从 3:45 降到 56 秒（4 倍），全部断言数不变、连续两遍 rc=0。做法是新增 os/test/hostlib.sh：**等判据那行日志出现就干净停机**，不再等 QZ_AUTOEXIT_S 走完。实测每个闸门的墙钟几乎精确等于「host 启动次数 × AUTOEXIT」（test_shell_apps 8×9s=72.7s、test-power-service 3×9s=27.1s、test-appauth 2×9s=18.1s、test-ipc-surface 1×12s=12.1s），而真正的工作只有每次 ~2.5s 开机；CPU 侧本来就不贵（空闲 9s 的 host 只用 0.02s CPU、0% 占用），所以要省的是**墙钟**——而墙钟正是每次改动等全部闸门跑完的时间。改造后：test_shell_apps 72.7→15.5s、verify-input 56.1→9.9s、verify-mips-e2e 45.3→8.4s、test-power-service 27.1→0.9s、test-appauth 18.1→0.9s、test-ipc-surface 12.1→0.4s"
+  source: "brain append-timeline：逐闸门计时 + 改造后逐闸门复测"
+  affects: [port-verification]
+
+- time: 2026-10-01T06:30:20
+  kind: note
+  summary: "把宿主进程改成「等判据出现就停」时踩了三个坑，都是**闸门自己的**问题而不是产品问题：① **哨兵必须可证明是最后一条**——拿「应用打的第一条结果」当哨兵，而回执投递顺序不保证，于是第二条先到、宿主被提前停掉、第三条回执永远丢失（这次是我自己引入的竞态）；改成让探针用 Promise.all 在全部 settle 后自己打完成标记。② **「按键后期望画面变化」不能用「按键数 +1」**——实测 down,down,enter 是 3 次提交（桌面 / 焦点移动 / 应用绘制），按 +1 等会在焦点移动那帧就停机、抓到桌面帧，症状是「标记区墨量 0」而看起来像产品坏了；改用「等提交次数稳定」（hz_wait_stable）。③ **回放按键必须用 hz_start 建的那个 FIFO**——调用方自己另建一个并把路径喂给 replay-keys，按键就写进了没人读的管道，宿主收不到输入，闸门报的是「no post-key commit」，指向完全错误的方向。另外「按键后期望**没有**变化」的用例（nav_stay/slowboot 断言的恰恰是「什么都没发生」）不能用稳定判据，只能给固定沉降——这类用例的沉降是语义的一部分，不是可以优化掉的浪费"
+  source: brain append-timeline
+  affects: [port-verification, qzos-ui-architecture]

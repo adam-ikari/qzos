@@ -18,10 +18,20 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 
 B=build-os
-[ -x "$B/qzos-host" ] || { echo "build first: scripts/build-os.sh" >&2; exit 1; }
+
+HZ_HOST=build-os/qzos-host
+[ -x "$HZ_HOST" ] || { echo "build first: scripts/build-os.sh" >&2; exit 1; }
+. os/test/hostlib.sh
+HZ_REPLAY=os/test/replay-keys.py
+HZ_ARCH=x86_64
 
 TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+HZ_FIFO_DIR="$TMP"
+if [ "${QZ_KEEP_TMP:-0}" = "1" ]; then
+  trap 'hz_stop; echo "tmp kept: $TMP"' EXIT
+else
+  trap 'hz_stop; rm -rf "$TMP"' EXIT
+fi
 SOCK="$TMP/rpc.sock"
 LOG="$TMP/host.log"
 pass=0; fail=0
@@ -31,14 +41,11 @@ bad()  { printf '  FAIL  %s\n' "$1"; fail=$((fail+1)); }
 bash tools/build-rpc-client.sh "$B" >/dev/null 2>&1
 CLIENT=/tmp/qzos-rpc-client
 
-( cd "$B" && QZ_DISPLAY=none QZ_RPC_SOCK="$SOCK" \
-    QZ_JS_DIR=../os/js QZ_APP_DIR=../os/js/apps QZ_AUTOEXIT_S=12 \
-    ./qzos-host >"$LOG" 2>&1 ) &
-HOST=$!
-trap 'kill $HOST 2>/dev/null || true; rm -rf "$TMP"' EXIT
+hz_start "$LOG" QZ_DISPLAY=none QZ_RPC_SOCK="$SOCK" \
+         QZ_JS_DIR=../os/js QZ_APP_DIR=../os/js/apps QZ_AUTOEXIT_S=20
 
 # 等 socket 出现，而不是 sleep 固定时长
-for _ in $(seq 1 60); do [ -S "$SOCK" ] && break; sleep 0.1; done
+for _ in $(seq 1 150); do [ -S "$SOCK" ] && break; sleep 0.1; done
 [ -S "$SOCK" ] || { echo "socket never appeared; host log:" >&2; cat "$LOG" >&2; exit 1; }
 
 # ---- 1. 需能力的方法不上 IPC，且 handler 真的没被调用 ----
@@ -107,6 +114,6 @@ else
   bad "启动日志没记录公开面/扣下的划分，无法核对"
 fi
 
-wait "$HOST" 2>/dev/null || true
+hz_stop
 printf '  %d passed, %d failed\n' "$pass" "$fail"
 [ "$fail" -eq 0 ]

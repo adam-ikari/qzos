@@ -285,6 +285,7 @@ bash scripts/verify-all.sh
 | `scripts/test-display.sh` | 显示纯逻辑：条带寻址、掩码移位、边界裁剪、脏区对齐、刷新决策（133 断言） | 否 / 否 |
 | `scripts/test-keymap.sh` | evdev 键码映射（82 断言，键码常量取自 `<linux/input.h>`） | 否 / 否 |
 | `scripts/test-power.sh` | 电源域决策层（43 断言）。场景矩阵，重点是**归属未知时全拒** | 否 / 否 |
+| `scripts/test-power-service.sh` | `sys.power.*` 接进服务面（15 断言）。三档：无 power 能力被拒 / 有能力但**归属未确认被拒且理由带回 JS** / 归属确认后**假 sysfs 里真的被写**（正对照）。写目标全在临时目录，绝不碰真机 sysfs | 是 / 否 |
 | `scripts/test-services.sh` | 系统服务注册表 + 授权来源规则（74 断言）。**JS→C 唯一边界的可验证形态**：注册表性质、default-deny、IPC 公开面规则、未绑定时报错 | 部分 |
 | `scripts/test-appauth.sh` | **授权来源**（9 断言）：零能力应用 `ui.setApp` 给自己加能力被拒 + 冒名目录被拒 + **正对照**（磁盘 manifest 是权威，声称与推导不符时以磁盘为准） | 是 / 否 |
 | `scripts/test-ipc-surface.sh` | 服务面**外部 IPC 半边**（8 断言）：外部进程调需能力的方法时 handler 从未被调用 + **正对照**（`sys.info` 必须调得通，否则「拒绝」可能只是客户端坏了）+ socket 权限 | 是 / 否 |
@@ -297,6 +298,35 @@ bash scripts/verify-all.sh
 | `tools/rpc-ipc-selftest.sh` | 手工探测：外部 IPC 客户端调 `sys.info`。**闸门是上面的 `test-ipc-surface.sh`** | 是 / 否 |
 
 前三项是毫秒级的纯逻辑单测——上层现象不对时先确认它们是绿的，否则容易在上层猜错方向。
+
+### 全量跑一次要多久：约 56 秒
+
+宿主相关闸门一律走 `os/test/hostlib.sh`：**等判据那行日志出现就干净停机**，
+而不是等 `QZ_AUTOEXIT_S` 走完。
+
+改造前实测每个闸门的墙钟**几乎精确等于**「host 启动次数 × AUTOEXIT」——
+`test_shell_apps` 8×9s = 72.7s，`test-power-service` 3×9s = 27.1s，
+`test-appauth` 2×9s = 18.1s，`test-ipc-surface` 1×12s = 12.1s。而真正的工作只有
+每次 ~2.5s 的开机。**全量 3:45 → 56 秒（4 倍）。**
+
+CPU 侧本来就不贵：空闲 9s 的 host 只用 0.02s CPU（0% 占用）。所以要省的是
+**墙钟**——而墙钟正是每次改动等全部闸门跑完的时间。
+
+三条约束（`hostlib.sh` 顶上写着理由）：
+
+- **哨兵必须可证明是最后一条。** 拿「应用打的第一条结果」当哨兵会提前停机，
+  把后面几条的回执丢掉——闸门自己引入的竞态。现在让探针用 `Promise.all`
+  在全部 settle 之后自己打一行完成标记。
+- **超时必须报错，不能静默继续。** 否则「日志被截断」会被读成「测试通过」。
+- **用 SIGTERM 而不是 SIGKILL。** 宿主有 handler（`uv_stop` → 正常 exit →
+  stdio flush）。SIGKILL 会丢掉缓冲里的日志行，而残缺文件恰好让**否定判据通过**。
+
+「按键后期望画面变化」一律用**等提交次数稳定**（`hz_wait_stable`），不用
+「按键数 +1」：实测 `down,down,enter` 是 3 次提交（桌面 / 焦点移动 / 应用绘制），
+按 +1 等会在焦点移动那帧就停机，抓到桌面帧。
+
+反过来，「按键后期望**没有**变化」的用例（`nav_stay` / `slowboot`，它们断言的
+恰恰是「什么都没发生」）不能用稳定判据，只能给固定沉降。
 
 **跑闸门要看退出码，不要只看断言行。** 曾经 `verify-frames.sh` 里
 `frame-preview.sh | head -3` 让 preview 收到 SIGPIPE 返回 141，`set -euo pipefail`
