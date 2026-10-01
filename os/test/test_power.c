@@ -10,7 +10,10 @@
 #include "power.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 static int checks, failed;
 static char failures[64][192];
@@ -157,6 +160,74 @@ int main(void)
     /* ---- NULL 描述符 ---- */
     ok(!may(NULL, QZOS_PWR_SUSPEND), "NULL 描述符拒动作");
     ok(why && strstr(why, "描述符") != NULL, "NULL 描述符有可显示的理由");
+
+    /* ---- qzos_power_active()：QZ_POWER_* 覆盖 + 「给了路径就开 cap」的耦合 ----
+     *
+     * 这个函数此前**一条测试都没有**，而它恰恰是决定真机能力的那一个：
+     * `if (s_active.shutdown_path) s_active.cap_shutdown = true;` 意思是
+     * 「显式配置即显式承诺」。于是**填一个路径就等于开一个能力**——而闸门 0
+     * 的 P3/P4 正是「该填哪些路径」这件事本身还没查清。
+     *
+     * 用 fork 而不是给生产代码加 reset：qzos_power_active() 把结果缓存在
+     * 文件作用域的 s_active_ready，同一进程内只能测一个场景。fork 出的子进程
+     * 拿到的是未初始化过的副本，语义上就是「一个刚启动的宿主」。
+     */
+    {
+        static const struct {
+            const char *name;
+            const char *backend;
+            const char *owner;      /* QZ_POWER_KEY_OWNER */
+            const char *shutdown;   /* QZ_POWER_SHUTDOWN */
+            int         may_shutdown;
+            const char *expect;
+        } sc[] = {
+            /* 缺省：什么都不做 */
+            { "default-none",        NULL,  NULL,  NULL,           0, "none" },
+            /* 未知后端名 → 退回 none，而不是猜一个 */
+            { "unknown-backend",     "no-such-thing", NULL, NULL,  0, "none" },
+            /* sim-fake 归属 none，但路径全空 → 仍拒（路径才是 load-bearing） */
+            { "sim-no-path",         "sim-fake", NULL, NULL,       0, "sim-fake" },
+            /* sim-fake + 只填 shutdown 路径 → cap 自动开 → 允许 */
+            { "sim-with-path",       "sim-fake", NULL, "/x/shut",  1, "sim-fake" },
+            /* 认不出的归属串 → unknown（fail-closed），不是「保持原值」 */
+            { "garbage-owner",       "sim-fake", "wat", "/x/shut", 0, "sim-fake" },
+            /* **关键一条**：真机描述符 + 填了 shutdown 路径，但归属仍 UNKNOWN
+             * → 仍然拒。这证明「顺手把 P4 路径填上」不会顺带打开关机。 */
+            { "device-path-only",    "mp-d261-unverified", NULL, "/x/shut", 0, "mp-d261-unverified" },
+            /* 归属确认成 none 之后，同一个路径才真的生效 */
+            { "device-owner-none",   "mp-d261-unverified", "none", "/x/shut", 1, "mp-d261-unverified" },
+        };
+        for (unsigned i = 0; i < sizeof(sc) / sizeof(sc[0]); i++) {
+            pid_t pid = fork();
+            if (pid == 0) {
+                /* 子进程：设 env → 取 active → 断言 → 用退出码回报。
+                 * 断言结果不能走父进程的计数器（那是 fork 前的副本）。 */
+                checks = failed = nfail = 0;
+                if (sc[i].backend) setenv("QZ_POWER", sc[i].backend, 1);
+                if (sc[i].owner)   setenv("QZ_POWER_KEY_OWNER", sc[i].owner, 1);
+                if (sc[i].shutdown) setenv("QZ_POWER_SHUTDOWN", sc[i].shutdown, 1);
+                const qzos_power_t *a = qzos_power_active();
+                int bad = 0, got = -1;
+                if (a) {
+                    got = may(a, QZOS_PWR_SHUTDOWN) ? 1 : 0;
+                    if (got != sc[i].may_shutdown) bad = 1;
+                    if (strcmp(a->name, sc[i].expect) != 0) bad = 1;
+                } else {
+                    bad = 1;
+                }
+                if (!bad) printf("  ok   %s\n", sc[i].name);
+                else       printf("  BAD  %s (backend=%s owner=%s may_shutdown=%d 期望=%d)\n",
+                                  sc[i].name, a ? a->name : "(null)",
+                                  a ? qzos_power_owner_name(a->key_owner) : "-",
+                                  got, sc[i].may_shutdown);
+                fflush(stdout);
+                _exit(bad ? 1 : 0);
+            }
+            int st = 0;
+            waitpid(pid, &st, 0);
+            ok(WIFEXITED(st) && WEXITSTATUS(st) == 0, sc[i].name);
+        }
+    }
 
     if (failed == 0) {
         printf("OK: %d checks, 0 failed\n", checks);
