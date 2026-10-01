@@ -132,6 +132,19 @@ JS（shell 与应用）碰到宿主 C 代码只有这一条路；UI 桥（`bridg
 { "sys.storage.statfs",    "storage", sys_storage_statfs_handler },
 ```
 
+能力表 5 项，服务面已覆盖 3 项：
+
+| 能力 | 状态 |
+| --- | --- |
+| `info` | `sys.info` —— **唯一 `cap=NULL` 的方法**：公开只读元信息，谁都能调 |
+| `storage` | `sys.storage.statfs` |
+| `power` | `sys.power.state` / `sys.power.request` |
+| `settings` | **未实现**。声明了没有方法：应用能声明、能拿到非空 perms，然后调不到任何东西 |
+| `net` | **未实现**。配网属 M9，且要先在真机上查清厂商栈（见 brain `c1-wifi-stack`） |
+
+「未实现」这件事写在 `os/test/test_services.c` 的显式清单里，不是靠记忆：加了
+能力忘了实现方法，那条断言会红。目的是让能力表和实际可达的方法集不漂移。
+
 两条规则：
 
 - **方法必须落在自己能力的命名空间下**（`sys.storage.*` 需要 `storage`）。启动时

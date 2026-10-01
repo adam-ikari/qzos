@@ -228,6 +228,82 @@ int main(void)
         ok(1, "带能力的方法都在自己能力的命名空间下");
     }
 
+    /* ---- 能力表不许悄悄漂移 ----
+     *
+     * 能力表里有 5 项，服务注册表里只覆盖了 3 项（info/storage/power）。
+     * `settings` 和 `net` 至今**没有任何方法**：应用可以声明它们、manifest 校验
+     * 会通过、授权会给出非空 perms —— 然后调不到任何东西。
+     *
+     * 这不是漏洞（没有方法 = 不可达），但它是一张 expectation 的口子：作者
+     * 看到能力表里有 `net`，会以为有某种方式能用它。所以把「哪些能力还没实现」
+     * 写成代码里的显式清单，而不是靠记忆：
+     *
+     *   - 新增一个能力却忘了实现方法 → 这条断言变红
+     *   - 实现了方法却忘了加能力 → 注册表的命名空间自洽检查会变红
+     *
+     * 为什么要显式写「未实现」：因为「表里有、方法没有」和「表里没有、方法有」
+     * 是两种不同的问题，而只有前者需要人去实现点什么。
+     */
+    {
+        /* 已知能力：必须与 appauth.c / apkg.js 的表一致（同步靠闸门，不靠约定） */
+        static const char *declared[] = {
+            "info", "storage", "settings", "net", "power"
+        };
+        /* 声明了但**还没有任何方法**的能力。给它的服务之前，先从这里删掉。 */
+        static const char *unimplemented[] = { "settings", "net" };
+        #define N_DECLARED ((int)(sizeof(declared) / sizeof(declared[0])))
+        #define N_UNIMPL  ((int)(sizeof(unimplemented) / sizeof(unimplemented[0])))
+
+        /* 每个「未实现」的能力，表里必须真有它（否则这条清单自己就错了） */
+        for (int i = 0; i < N_UNIMPL; i++) {
+            bool found = false;
+            for (int k = 0; k < N_DECLARED; k++) {
+                if (strcmp(unimplemented[i], declared[k]) == 0) { found = true; break; }
+            }
+            ok(found, "「未实现」清单里的能力确实在能力表中");
+        }
+        /* 反向：表里每一项，要么有方法，要么在「未实现」清单里。
+         * 加了能力忘了实现方法 → 这里红。 */
+        int orphan = 0;
+        char msg[192];
+        for (int i = 0; i < N_DECLARED; i++) {
+            /* 「实现了」= 存在一个落在 sys.<cap> 命名空间下的方法。
+             *
+             * 注意 info 是特例：sys.info 的 cap 是 NULL（公开只读元信息，
+             * 任何调用方都能调），所以按「method_cap == 能力名」去匹配会漏掉它。
+             * 把它单列，是因为「无需能力」与「需要该能力」是两种不同的注册形态，
+             * 而 info 是当前唯一的前者——这个特例值得写在代码里，而不是让读者
+             * 自己发现「表里说没实现、其实有」。 */
+            bool has_method = (strcmp(declared[i], "info") == 0 &&
+                               qzos_services_has_method("sys.info"));
+            if (!has_method) {
+                static const char *probe2[] = {
+                    "sys.storage.statfs", "sys.storage.list",
+                    "sys.power.state", "sys.power.request",
+                    "sys.settings.get", "sys.settings.set",
+                    "sys.net.scan", "sys.net.connect"
+                };
+                for (unsigned m = 0; m < sizeof(probe2) / sizeof(probe2[0]); m++) {
+                    const char *c = qzos_services_method_cap(probe2[m]);
+                    if (c && strcmp(c, declared[i]) == 0) { has_method = true; break; }
+                }
+            }
+            if (has_method) continue;
+            bool listed = false;
+            for (int k = 0; k < N_UNIMPL; k++) {
+                if (strcmp(unimplemented[k], declared[i]) == 0) { listed = true; break; }
+            }
+            if (listed) continue;
+            orphan++;
+            snprintf(msg, sizeof(msg),
+                     "能力 '%s' 既没有方法、也没进「未实现」清单——表漂移了", declared[i]);
+            ok(0, msg);
+        }
+        ok(orphan == 0, "能力表没有既无方法又没登记的项");
+        /* 能力表里的项数本身也钉住：加能力是有意的动作，不是顺手加字符串 */
+        ok(N_DECLARED == 5, "能力表 5 项（info/storage/settings/net/power）");
+    }
+
     /* ---- IPC 公开面：需能力的方法一律不上 IPC ----
      *
      * 授权检查住在 qzos_services_rpc()，那是 INPROC 路径。IPC 路径没有可用的
