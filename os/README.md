@@ -315,7 +315,7 @@ bash scripts/verify-all.sh
 | `os/test/verify-rt-recovery.sh` | JS 引擎崩溃恢复：杀 `qzjs-rt`，断言屏上出现提示、rt 被重建、桌面逐字节复现、开机失败也留在退避循环 | 是 / 否 |
 | `scripts/verify-input.sh` | 键盘端到端（`QZ_INPUT0` 接 FIFO 回放）+ e-ink 刷新预算 | 是 / 否 |
 | `scripts/verify-frames.sh` | 原生 vs MIPS 帧逐字节一致（MIPS 经 qemu-user） | 是 / 否 |
-| `scripts/verify-mips-e2e.sh` | MIPS 端到端：桌面/键盘/应用发现/授权遮蔽/`sys.power.*` 在 qemu-user 下逐条验（10 断言）。**开头先验二进制新鲜度**，过期就拒绝运行 | 是 / 否 |
+| `scripts/verify-mips-e2e.sh` | MIPS 端到端：桌面/键盘/应用发现/授权遮蔽/`sys.power.*` 在 qemu-user 下逐条验（11 断言，含 `assert_engine_up`）。**开头先验二进制新鲜度**，过期就拒绝运行 | 是 / 否 |
 | `tools/rpc-ipc-selftest.sh` | 手工探测：外部 IPC 客户端调 `sys.info`。**闸门是上面的 `test-ipc-surface.sh`** | 是 / 否 |
 
 前三项是毫秒级的纯逻辑单测——上层现象不对时先确认它们是绿的，否则容易在上层猜错方向。

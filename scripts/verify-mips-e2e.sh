@@ -61,9 +61,33 @@ run_mips() {  # run_mips <name> <app_dir> [keys] [settle_ms]
   [ -s "$frame" ] || { echo "no frame for $name" >&2; tail -8 "$log" >&2; return 1; }
 }
 
+# 引擎必须真的起来了 —— 而且这条是**指名**一个失效面的。
+#
+# 交叉构建时 polyfill 字节码是用**宿主** qjsc 生成的（QZ_QJSC_HOST：默认那个
+# qjsc 是 MIPS 二进制，宿主跑不了）。于是「宿主 qjsc 产出的字节码与目标引擎的
+# BC_VERSION 不匹配」成了一个新引入的失效面：引擎拒读 → qz_create 返回 NULL
+# → 宿主起不来 → 桌面永远不出现。
+#
+# 不显式断言的话，这个失效会以「渲染异常」的形式冒出来，排查时想到的是屏幕、
+# 主题、面板——而不是字节码版本。
+assert_engine_up() {  # assert_engine_up <log> <label>
+  local log="$1" label="$2"
+  if grep -q "JS engine up" "$log"; then
+    ok "$label 引擎起来了（polyfill 字节码被目标引擎接受）"
+  else
+    bad "$label 引擎没起来：$(grep -oE "qz_create failed|boot[^\"]*" "$log" | head -1)"
+    return 1
+  fi
+  if grep -qE "boot.failure|boot failed" "$log"; then
+    bad "$label 开机脚本失败：$(grep -oE 'boot[^"]*' "$log" | head -1)"
+    return 1
+  fi
+}
+
 echo "==> MIPS: 桌面起来了"
 mkdir -p "$OUT/empty"
 if run_mips desk "$OUT/empty" ""; then
+  assert_engine_up "$OUT/desk.log" "MIPS"
   ink=$(python3 os/test/pbm_view.py --region "$OUT/desk.pbm" --at 8,41,280,16 \
         | sed -n 's/.*-> \([0-9]*\) ink px/\1/p')
   if [ "${ink:-0}" -gt 100 ]; then

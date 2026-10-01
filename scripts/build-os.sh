@@ -23,6 +23,30 @@ if [ "$TARGET" = "mips" ]; then
   export PATH="$PWD/.tools:$PATH"
   BUILD_DIR="${BUILD_DIR:-build-os-mips}"
   TOOLCHAIN=(-DCMAKE_TOOLCHAIN_FILE="$PWD/cmake/toolchains/mipsel-zig.cmake")
+
+  # 交叉构建需要 polyfill 工具链（内嵌字节码是构建产物），而它要调 qjsc ——
+  # 默认取的是本构建目录里那个 qjsc，那是 **MIPS** 二进制，x86 宿主跑不了
+  # （Exec format error），整个构建第一步就死。
+  #
+  # 所以这里显式给一个宿主可运行的 qjsc。顺序不能反：得先有宿主构建产出，
+  # 才拿得到它的 qjsc —— 而它正是 polyfill 的 npm 工具链被装上的那次构建
+  # （node + esbuild 只在宿主侧需要）。
+  if [ ! -x build-os/deps/quickjs-ng/qjsc ]; then
+    echo "==> MIPS build needs a host qjsc for the polyfill step; building the host first" >&2
+    BUILD_DIR=build-os "$0"
+    [ -x build-os/deps/quickjs-ng/qjsc ] || {
+      echo "host qjsc still missing at build-os/deps/quickjs-ng/qjsc" >&2; exit 1; }
+  fi
+  # node + esbuild 是 polyfill 工具链。缺了它，qzjs 的 CMake 会去找那份已生成
+  # 的 polyfill_default.c；新版本里那是 gitignore 的产物，fresh clone 上不存在。
+  if [ ! -d qzjs/polyfill/node_modules/esbuild ]; then
+    command -v npm >/dev/null 2>&1 || {
+      echo "polyfill toolchain missing (no node_modules/esbuild) and npm not on PATH." >&2
+      echo "run: npm --prefix qzjs/polyfill ci" >&2; exit 1; }
+    echo "==> installing polyfill toolchain (node + esbuild)"
+    npm --prefix qzjs/polyfill ci >/dev/null
+  fi
+  TOOLCHAIN+=(-DQZ_QJSC_HOST="$PWD/build-os/deps/quickjs-ng/qjsc")
 else
   BUILD_DIR="${BUILD_DIR:-build-os}"
   TOOLCHAIN=()

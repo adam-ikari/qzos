@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [toolchain, build]
 created: "2026-09-29T00:51:31"
-updated: "2026-10-01T07:45:01"
+updated: "2026-10-01T09:57:38"
 ---
 
 <!-- compiled_truth -->
@@ -71,3 +71,9 @@ updated: "2026-10-01T07:45:01"
   summary: "**qzjs 85d056a9 → 960f24d5（25 提交）已评估，决定暂不升。** 公开头 qzjs.h 无变化、`qz_config_t.initial_script` 不变，所以对我们是纯 gitlink 升级；原生构建与全量闸门都过（rc=0），MIPS 端到端也过。**但那个 MIPS 全绿是假的**（见下一条）。升不升的理由：收益是 mbedtls 3.6.7 + timingSafeEqual 等内部修复（宿主不用 TLS，收益有限），代价是**交叉构建不再可能**——`821c3cf5 fix(build)!: 内嵌字节码改为纯构建产物——不再 committed` 把 src/polyfill_default.c 变成 gitignore 的产物，而重新生成它必须用**目标架构的 qjsc**（qzjs 的 CMake 把 QJSC 硬写成 $<TARGET_FILE:qjsc>），于是 x86 宿主上 Exec format error。`b383449d feat(runtime)!: 启动脚本改经管道传递` 本身对我们无感（只改了 --script PATH → --script-stdin 的内部传输）。**需要上游改的**：让 QJSC 可覆盖（例如 -DQZ_QJSC_HOST=<宿主 qjsc 路径>），或把 polyfill 字节码生成提成宿主侧步骤。qzjs 自己的注释已经警告过相邻风险：「撞上残留旧版 qjsc 会静默产出引擎拒读的字节码 → JS_ReadObject: invalid version → qz_create 返回 NULL」——对交叉构建来说「构建目录自己那个 qjsc」按定义就是错架构的那个"
   source: "brain append-timeline：升级评估 + 实测交叉构建失败"
   affects: [zig-musl-cross-build, qzos-as-system]
+
+- time: 2026-10-01T09:57:38
+  kind: evidence
+  summary: "**qzjs 已升级到 bdbbb637（origin/master 960f24d5 + 一条上游改动），交叉构建恢复。** 上游那条是 821c3cf5「内嵌字节码改为构建产物、不再 committed」带来的阻塞的解法：新增 CMake 选项 QZ_QJSC_HOST，让交叉构建能给 polyfill 一个**能在宿主机上运行**的 qjsc（默认那个是 $<TARGET_FILE:qjsc>，交叉构建时是目标架构二进制，x86 宿主 Exec format error）。不设该选项时行为完全不变。已推到 qzjs 的 cross-build-qjsc 分支；本仓只记 gitlink SHA。**一致性由调用方负责**：那个宿主 qjsc 必须由同一份 quickjs-ng 编出，所以本仓 build-os.sh --mips 的顺序是先编宿主再编目标（两者共用 deps/quickjs-ng，BC_VERSION 一致）。**这个方案引入了一个新失效面**：宿主 qjsc 产出的字节码若与目标引擎的 BC_VERSION 不匹配 → 引擎拒读 → qz_create 返回 NULL → 桌面永不出现。所以 verify-mips-e2e 加了 assert_engine_up 显式断言「JS engine up」且无 boot failure——不显式断言的话，这个失效会以「渲染异常」的形式冒出来，排查时想到的是屏幕和主题，而不是字节码版本"
+  source: "brain append-timeline：从零 rm -rf build-os-mips 重建通过 + 全量 rc=0 + MIPS e2e 11 断言"
+  affects: [zig-musl-cross-build, port-verification]

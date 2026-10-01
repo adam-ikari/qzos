@@ -1,6 +1,6 @@
 # Brain Index
 
-_Auto-generated. Last updated 2026-10-01T07:45:01.659Z._
+_Auto-generated. Last updated 2026-10-01T09:57:38.549Z._
 
 - [c1-slim-device](pages/c1-slim-device.md) — category: reference | tags: [hardware, target, device] | 移植目标硬件：**C1 Slim / MP-D261**（快易典 MagicPen 系列电子纸学习机），资料与构建方式参考 [Kasiin/C1-Slim-Ports](https://github.com/Kasiin/C1-Slim-Ports)。
 - [c1-wifi-stack](pages/c1-wifi-stack.md) — category: reference | tags: [wifi, network, device] | 射频是 **atbm603x SDIO**，模块 `/etc/firmware/atbm603x_wifi_sdio.ko` **按需 insmod**——默认不开 WiFi，`lsmod` 空、`/sys/class/net/wlan0` 不存在是正常状态。
