@@ -85,6 +85,79 @@ else
   bad "MIPS 键盘场景失败"
 fi
 
+echo "==> MIPS: sys.power.* 在 MIPS 上也通（真机就是 MIPS）"
+# 这条不是为了覆盖功能（原生那侧已经 15 断言），是为了**架构**：
+# power handler 里有两处最容易出 ABI 问题的地方——
+#   - json_escape() 逐字节处理，含多字节 UTF-8 的中文理由
+#   - params 走 cJSON_Parse，长度判断是手写的 memcmp
+# 这两处在 x86_64 上都对，在 MIPS32 上（大小端、char 符号性、size_t 宽度）
+# 完全可能是另一回事。而真机就是 MIPS32r2，所以这条必须在 qemu 下过一遍。
+#
+# 写目标指向临时目录里的假文件——P3/P4 未验，绝不碰真机 sysfs。
+mkdir -p "$OUT/pwrfake"
+printf '42\n' > "$OUT/pwrfake/capacity"
+printf 'Discharging\n' > "$OUT/pwrfake/state"
+: > "$OUT/pwrfake/shutdown"
+JS3="$OUT/js3"
+mkdir -p "$JS3/apps/pwr"
+for f in ui.js apkg.js sandbox.js shell.js; do ln -s "$PWD/os/js/$f" "$JS3/$f"; done
+cat > "$JS3/apps/pwr/app.json" <<'PWRJ'
+{ "schema":1,"id":"pwr","name":"PowerProbe","version":"1.0.0","api":1,
+  "entry":"app.js","perms":["power"] }
+PWRJ
+cat > "$JS3/apps/pwr/app.js" <<'PWRJ'
+var a = ui.rpc('sys.power.state', {}).then(function (r) {
+  console.log('PWRS owner=' + r.key_owner + ' percent=' + r.percent +
+              ' allowed=' + r.actions.shutdown.allowed);
+}, function () { console.log('PWRS REJECTED'); });
+var b = ui.rpc('sys.power.request', { action: 'shutdown' }).then(function (r) {
+  console.log('PWRQ ' + JSON.stringify(r));
+}, function () { console.log('PWRQ REJECTED'); });
+var c = ui.rpc('sys.power.request', { action: 'halt' }).then(function (r) {
+  console.log('PWRT ' + JSON.stringify(r));
+}, function () { console.log('PWRT REJECTED'); });
+Promise.all([a, b, c]).then(function () { console.log('PWRDONE'); });
+PWRJ
+hz_set_cmd "$QEMU" "$PWD/$BD/qzos-host"
+hz_start "$OUT/pwr.log" QZ_DISPLAY=pbm QZ_PBM="$OUT/pwr.pbm" QZ_RPC_SOCK=none \
+         QZ_JS_DIR="$JS3" QZ_APP_DIR="$OUT/empty" \
+         QZ_RT_SERVER="$OUT/qzjs-rt.sh" QZ_AUTOEXIT_S=25 \
+         QZ_POWER_KEY_OWNER=none QZ_POWER_STATE="$OUT/pwrfake/state" \
+         QZ_POWER_CAPACITY="$OUT/pwrfake/capacity" \
+         QZ_POWER_SHUTDOWN="$OUT/pwrfake/shutdown"
+if hz_wait_desktop 40; then
+  python3 os/test/replay-keys.py --arch mips32 --script enter --out "$(hz_fifo)" >/dev/null 2>&1
+  hz_wait 'PWRDONE' 40 || true
+else
+  bad "MIPS power 探针那次运行没到桌面"
+fi
+hz_stop
+pwrs_line=$(grep -o 'PWRS.*' "$OUT/pwr.log" | head -1)
+pwrq_line=$(grep -o 'PWRQ.*' "$OUT/pwr.log" | head -1)
+pwrt_line=$(grep -o 'PWRT.*' "$OUT/pwr.log" | head -1)
+# 中文理由必须原样回来：那串字节要经过 json_escape 再被 cJSON 解析回来，
+# 少一个字节就会变成非法 JSON，而宿主的反应是把 JS 引擎打死（bad-json）。
+if echo "$pwrs_line" | grep -q "owner=none" && echo "$pwrs_line" | grep -q "percent=42"; then
+  ok "MIPS 上 sys.power.state 正常（含 UTF-8 理由与定长解析）"
+else
+  bad "MIPS 上 sys.power.state 异常: ${pwrs_line:-（没跑起来）}"
+fi
+if echo "$pwrq_line" | grep -q '"ok":true'; then
+  ok "MIPS 上 sys.power.request 执行了（假 sysfs 里有内容）"
+else
+  bad "MIPS 上 sys.power.request 异常: ${pwrq_line:-（没跑起来）}"
+fi
+if [ -s "$OUT/pwrfake/shutdown" ]; then
+  ok "MIPS 上写动作真的落到文件（不是只回了 ok:true）"
+else
+  bad "MIPS 上关了口却没写文件"
+fi
+if echo "$pwrt_line" | grep -q "unknown action"; then
+  ok "MIPS 上动作名解析正确（halt → unknown action，不是被当成 shutdown）"
+else
+  bad "MIPS 上动作名解析异常: ${pwrt_line:-（没跑起来）}"
+fi
+
 echo "==> MIPS: 授权面确实装上了（__native__ 后门被遮）"
 # 在 JS 侧自报：应用若能看到 __native__.fsWrite 就说明遮蔽没生效。
 #
@@ -105,16 +178,20 @@ console.log('SANDBOX n=' + typeof globalThis.__native__ +
 EOF
 run_mips probe "$OUT" "down,down,enter" || true
 probe_line=$(grep -o 'SANDBOX.*' "$OUT/probe.log" | head -1)
-# 两半都要验：遮蔽生效，且**用户目录的应用 perms 为空**（fail-closed 在 MIPS 上
-# 同样成立）。只验前半会漏掉「授权在 MIPS 上被静默放开」；只验后半则完全测
-# 不到遮蔽——两个是不同的失效面。
+# 两半都要验：遮蔽生效，且**用户目录的应用 perms 为空**。只验前半会漏掉
+# 「授权在 MIPS 上被静默放开」；只验后半则完全测不到遮蔽——两个是不同的失效面。
+#
+# 第二半的**原因**不是「JS 侧 statMode 原语未实现」（那是旧结论）：现在能力由
+# C 侧 appauth.c 从 <QZ_JS_DIR>/apps 推导，用户目录**根本不在受信根里**，
+# 所以是设计上的 fail-closed。写清原因很重要——否则下一个人会以为「把 statMode
+# 补上就能让用户应用拿到能力」，而那正好会把授权模型打开一个口子。
 if echo "$probe_line" | grep -q "n=object fw=undefined ps=undefined"; then
   ok "MIPS 上遮蔽生效（__native__ 在、fsWrite/processSpawn 不可见）"
 else
   bad "MIPS 上遮蔽异常: ${probe_line:-（应用没跑起来）}"
 fi
 if echo "$probe_line" | grep -q "perms=\[\]"; then
-  ok "MIPS 上用户目录应用 fail-closed（perms=[]，statMode 原语未实现）"
+  ok "MIPS 上用户目录应用 fail-closed（perms=[]：授权只从 <JS_DIR>/apps 推导）"
 else
   bad "MIPS 上用户目录应用拿到了授权（应为空）: ${probe_line:-（无输出）}"
 fi
