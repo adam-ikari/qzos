@@ -17,6 +17,8 @@
  */
 #include "qzos.h"
 
+#include "appauth.h"
+
 #include <uvrpc.h>
 
 #include <stdbool.h>
@@ -41,20 +43,13 @@ static char s_ipc_addr[256];
  * 「缺省为空」是关键不变量：宿主启动后、shell 发来 op:app 之前，任何 rpc 都
  * 应当被拒。这让「忘记初始化授权」表现为**拒绝**而不是**放行**。
  */
-static char s_app_caps[8][16];
+/* 能力数组本身住在 appauth 推导结果里。已知能力表也搬去了 appauth.c ——
+ * 判定与「表是什么」必须在同一个文件，否则加一个能力要记得改两处，
+ * 而漏改的后果是「新能力谁都拿不到」或「旧表把新方法当表外」。 */
+#define MAX_CAPS 8
+static char s_app_caps[MAX_CAPS][16];
 static int  s_app_n_caps;
-static int  s_app_active;
-
-/* 已知能力表。表外的能力在 op:app 时整条拒绝（不放行、也不静默忽略）。
- *
- * 这张表与 os/js/apkg.js 的 CAPS 必须一致。两处各写一份是有意的冗余：
- * JS 侧那份用于**发现与展示**（manifest 校验、ui 隐藏做不到的按钮），
- * C 侧这份用于**强制**。JS 那份被改坏时最多让 UI 显示出错的按钮；C 这份被
- * 改坏才是安全问题。所以「同步两张表」靠测试，不靠约定。 */
-static const char *const s_known_caps[] = {
-    "info", "storage", "settings", "net", "power"
-};
-#define N_KNOWN_CAPS ((int)(sizeof(s_known_caps) / sizeof(s_known_caps[0])))
+static bool s_app_active;   /* 0 = 桌面/未声明 ⇒ 缺省全拒 */
 
 /* ---- 方法注册表：C 能力的完整清单 ----
  *
@@ -193,48 +188,45 @@ void qzos_services_rpc(const char *method, const char *params_json,
     }
 }
 
-/* ---- 授权上下文（由 bridge.c 从 op:app 转发进来）---- */
-
-bool qzos_services_set_app_perms(const char *id, char caps[][16], int n)
+/* ---- 授权上下文：**只从磁盘 manifest 推导**（brain: qzos-service-boundary）----
+ *
+ * 这里曾经有个公开的 qzos_services_set_app_perms(id, caps, n)，由 op:app 把
+ * JS 传来的 perms 数组灌进来。那是**完整的提权漏洞**：应用与 shell 共享同一个
+ * QuickJS 全局，`ui` 是全局对象，于是任何应用都能调
+ * `ui.setApp('self', ['storage'])` 给自己授权。实测 perms: [] 的应用真的
+ * 调通了 sys.storage.statfs。
+ *
+ * 授权判定放在服务面（对），但**判定的输入由攻击者提供**（错）。所以现在：
+ *   - set_app_perms 不再是公开面的一部分，消息里带什么 perms 一律不看；
+ *   - 唯一的合法来源是 appauth.c 从 <apps-root>/<id>/app.json 重新推导。
+ *
+ * JS 可以点名一个应用，不能决定它能做什么。
+ */
+static void set_caps_from_disk(const char *id)
 {
-    memset(s_app_caps, 0, sizeof(s_app_caps));
+
     s_app_n_caps = 0;
     s_app_active = 0;
 
-    if (!id) return true;            /* clear */
-    {
-        int max = (int)(sizeof(s_app_caps) / sizeof(s_app_caps[0]));
-        int got = 0;
-        /* 表外能力：整条拒绝。理由同 apkg.js —— 静默忽略会让应用带着残缺授权在
-         * 系统里跑而作者不知情。 */
-        for (int i = 0; i < n; i++) {
-            bool known = false;
-            for (int k = 0; k < N_KNOWN_CAPS; k++) {
-                if (strcmp(caps[i], s_known_caps[k]) == 0) { known = true; break; }
-            }
-            if (!known) {
-                fprintf(stderr, "qzos-services: unknown cap '%s' — refusing app '%s'\n",
-                        caps[i], id);
-                /* 计数也要清：只把 s_app_active 清零的话，s_app_n_caps 里还留着
-                 * 已经写进去的那几个，查询接口会报告一个「其实没生效」的授权。
-                 * 宁可报 0 个能力，也不要报一个半截的。 */
-                s_app_n_caps = 0;
-                return false;
-            }
-            if (got >= max) break;
-            /* 写进 **got**（已写入个数），不是 **n**（输入总数）。
-             * 写成 s_app_caps[n] 的话，输入 2 个能力会两次都写进 index 2，
-             * 结果是 3 个槽位里两个空串 + 一个 storage —— 授权**静默给错**，
-             * 而表现只是「有的服务莫名其妙调不通」。这个 bug 是 test_services
-             * 的「两个能力都记下了」抓出来的。 */
-            snprintf(s_app_caps[got], sizeof(s_app_caps[0]), "%s", caps[i]);
-            got++;
-        }
-        s_app_n_caps = got;
-    }
+    if (!id) return;                    /* back / 桌面：清空，回到缺省全拒 */
+
+    int n = 0;
+    char caps[MAX_CAPS][16];
+    /* 解析失败也照样进入「已激活、零能力」状态：区别在于此时一条能力都没有，
+     * 而不是沿用上一个应用的授权。 */
+    (void)qzos_apputil_caps_from_manifest(id, caps, MAX_CAPS, &n);
+    for (int i = 0; i < n && i < MAX_CAPS; i++)
+        snprintf(s_app_caps[i], sizeof(s_app_caps[0]), "%s", caps[i]);
+    s_app_n_caps = n;
     s_app_active = 1;
-    fprintf(stderr, "qzos-services: app '%s' authorized (%d caps)\n", id, s_app_n_caps);
-    return true;
+    fprintf(stderr, "qzos-services: app '%s' authorized (%d caps, from manifest)\n",
+            id, s_app_n_caps);
+}
+
+/* op:app 的唯一入口。**id 之外的一切参数都不看。** */
+void qzos_services_note_app(const char *id)
+{
+    set_caps_from_disk(id);
 }
 
 int qzos_services_app_caps(char out[][16], int max)

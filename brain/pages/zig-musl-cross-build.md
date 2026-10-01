@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [toolchain, build]
 created: "2026-09-29T00:51:31"
-updated: "2026-09-30T02:55:25"
+updated: "2026-10-01T05:45:18"
 ---
 
 <!-- compiled_truth -->
@@ -53,3 +53,9 @@ updated: "2026-09-30T02:55:25"
   summary: Rewrote compiled_truth to the new best understanding
   source: brain update-truth
   affects: [zig-musl-cross-build]
+
+- time: 2026-10-01T05:45:18
+  kind: note
+  summary: "**qzjs 的嵌套子模块补丁由 qzjs/CMakeLists.txt 自己在配置阶段打**（quickjs-ng-c99-atomics / quickjs-ng-drain-jobs / libuv-c99-atomics，带「已应用则跳过」的幂等分支），所以仓内 scripts/ 与 tools/ 里搜不到任何 git apply 属正常。曾据此误判为「fresh clone 不可复现」——把 libuv 与 quickjs-ng 两个嵌套子模块 checkout 回干净上游再构建，CMake 重新打上补丁，工作树与还原前逐行相同（101/331 行），全量闸门 rc=0。另有 5 个补丁文件未被构建引用（quickjs-ng-bc-reader-hardening / quickjs-ng-debugger），内容已含在现用补丁里或已被取代。推论：**判断可复现性问题要在正确的层找补丁应用点**，本仓的补丁层在子模块自己的 CMake 里，不在本仓脚本里；「本仓搜不到 patch」不等于「没人打 patch」"
+  source: brain append-timeline
+  affects: [zig-musl-cross-build, port-verification]

@@ -16,6 +16,8 @@
  */
 #include "qzos.h"
 
+#include "appauth.h"
+
 #include <lvgl.h>
 #include <qzjs/qzjs.h>
 #include <uv.h>
@@ -335,6 +337,19 @@ int main(void)
     lv_obj_set_style_text_color(lv_screen_active(), lv_color_black(), 0);
     lv_obj_set_style_radius(lv_screen_active(), 0, 0);
     qzos_input_init(&s_loop);
+    /* 授权的受信根必须**在服务面起来之前**设好：能力由 appauth.c 从
+     * <root>/<id>/app.json 推导，root 缺失 = 所有应用零能力（fail-closed）。
+     *
+     * 用 <js_dir>/apps 而不是 QZ_APP_DIR（默认 /storage）：用户可写的目录
+     * 不能当授权的来源，否则「把一个 app.json 拷进 /storage 就能拿到 power」
+     * 成立。内置目录与用户目录的两路信任（brain: qzos-app-package）在 C 侧
+     * 就落在这里——本仓目前只有内置这一路获得能力。 */
+    {
+        char apps_root[512];
+        snprintf(apps_root, sizeof(apps_root), "%s/apps", js_dir);
+        qzos_apputil_set_apps_root(apps_root);
+        fprintf(stderr, "qzos-host: trusted apps root = %s\n", apps_root);
+    }
     qzos_services_init(&s_loop);
 
     uv_timer_init(&s_loop, &s_lv_timer);

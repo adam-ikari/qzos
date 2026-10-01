@@ -30,6 +30,9 @@ bash scripts/test-services.sh
 step "service-plane IPC surface (external procs must not reach cap methods)"
 bash scripts/test-ipc-surface.sh
 
+step "app authorization provenance (caps come from disk manifest, not the message)"
+bash scripts/test-appauth.sh
+
 step "app package + sandbox unit tests (real qzjs, no device)"
 bash scripts/test-apkg.sh
 

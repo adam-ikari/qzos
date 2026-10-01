@@ -35,8 +35,12 @@ void qzos_services_rpc(const char *method, const char *params_json,
                        qzos_rpc_done_t done, void *u);
 const char *qzos_services_addr(void);
 /* 授权上下文（brain: qzos-service-boundary）。服务面是 JS→C 的唯一通道，
- * 所以检查与状态都在这里；渲染桥只负责转交 op:app。缺省为空 = 全拒。 */
-bool qzos_services_set_app_perms(const char *id, char caps[][16], int n);
+ * 所以检查与状态都在这里；缺省为空 = 全拒。
+ *
+ * 注意这里**没有** set_app_perms(id, caps, n)：曾经有，而它是完整的提权漏洞
+ * ——JS 消息里的 perms 数组由应用自己填写。唯一入口是 note_app(id)，能力由
+ * appauth.c 从磁盘 manifest 重新推导。JS 可以点名一个应用，不能决定它能做什么。 */
+void qzos_services_note_app(const char *id);
 int  qzos_services_app_caps(char out[][16], int max);
 /* 注册表里 C 能力方法的总数（闸门用它核对「注册表之外无 C 能力」）*/
 int  qzos_services_method_count(void);

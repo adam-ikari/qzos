@@ -21,8 +21,8 @@ fi
 
 cc -std=gnu99 -O1 -Wall -Wextra -Werror \
    -I os/src -I third_party/uvrpc/include -I os/third_party/uvrpc-generated \
-   -I qzjs/deps/libuv/include \
-   os/src/services.c os/test/test_services.c \
+   -I qzjs/deps/libuv/include -I qzjs/deps/cjson \
+   os/src/services.c os/src/appauth.c os/test/test_services.c \
    -o "$BIN/test_services" \
    build-os/libqzos_uvrpc.a build-os/libqzos_flatcc.a \
    build-os/qzjs/libcjson.a build-os/lvgl/liblvgl.a build-os/libqzos_fonts.a \

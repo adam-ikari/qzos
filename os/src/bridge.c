@@ -361,31 +361,37 @@ static void rpc_done(int ok, const char *result, size_t len, void *u)
 }
 
 /* op:app — 声明/清空当前应用授权。**只是转交**给服务面：本文件不判定、
- * 也不保存状态。表外能力由 qzos_services_set_app_perms 整条拒绝。 */
+ * 也不保存状态——**perms 字段一律不看**，能力由 appauth.c 从磁盘 manifest
+ * 推导。见表下面那段注释。 */
 static void op_app(cJSON *j)
 {
     cJSON *jid = cJSON_GetObjectItem(j, "id");
     const char *id = cJSON_IsString(jid) ? jid->valuestring : NULL;
+
+    /* **只转发 id。perms 字段一律不看** —— 即使它带着、即使格式正确。
+     *
+     * 这里曾经把消息里的 perms 数组当授权收下，那是完整的提权漏洞：应用与
+     * shell 共享同一个 QuickJS 全局，`ui` 是全局对象，于是任何应用都能调
+     * `ui.setApp('self', ['storage'])` 给自己授权。实测一个 perms: [] 的
+     * 应用真的调通了 sys.storage.statfs。不需要外部进程、不需要 socket。
+     *
+     * 授权的合法来源只有磁盘上的 <apps-root>/<id>/app.json（appauth.c）。
+     * JS 可以点名一个应用，不能决定它能做什么。
+     *
+     * 带着 perms 字段来还**要记账**：静默忽略会让「我明明写了 perms」这件事
+     * 完全不可见，于是下一个花半天找「为什么我的能力没生效」。 */
     cJSON *perms = cJSON_GetObjectItem(j, "perms");
-    char caps[MAX_CAPS][16];
-    int n = 0;
+    int claimed = (cJSON_IsArray(perms)) ? cJSON_GetArraySize(perms) : -1;
 
-    if (!perms || !cJSON_IsArray(perms)) {
-        qzos_bridge_sendf("{\"evt\":\"error\",\"msg\":\"op:app needs perms array\"}");
-        return;
-    }
-    cJSON *it;
-    cJSON_ArrayForEach(it, perms) {
-        if (n >= MAX_CAPS) break;
-        if (!cJSON_IsString(it)) continue;
-        if (strlen(it->valuestring) >= sizeof(caps[0])) continue;
-        snprintf(caps[n], sizeof(caps[0]), "%s", it->valuestring);
-        n++;
-    }
+    qzos_services_note_app(id);
 
-    if (!qzos_services_set_app_perms(id, caps, n)) {
-        /* 表外能力：整条拒绝。宁可这次 launch 失败，也不要半授权。 */
-        qzos_bridge_sendf("{\"evt\":\"error\",\"msg\":\"op:app: unknown capability\"}");
+    char got[8][16];
+    int n = qzos_services_app_caps(got, 8);
+    if (id && claimed >= 0 && claimed != n) {
+        fprintf(stderr,
+                "qzos-bridge: op:app id='%s' claimed %d cap(s), host derived %d "
+                "from manifest — claim ignored\n",
+                id, claimed, n);
     }
 }
 
