@@ -32,7 +32,11 @@ echo "==> uvrpc submodule: $(git -C "$UV" rev-parse --short HEAD 2>/dev/null || 
 #    qzos_uvrpc 的 PUBLIC include 目录（见 os/CMakeLists.txt），所以同样
 #    不需要复制——这里只做存在性检查。
 missing=0
-for f in rpc_builder.h rpc_reader.h flatbuffers_common_builder.h flatbuffers_common_reader.h; do
+# rpc_verifier.h 是 4ed752a 起 uvrpc_flatbuffers.c 需要的（上游 flatcc 加了 -v）。
+# 少列它的话，产物过期会表现成编译期「rpc_verifier.h: No such file or directory」，
+# 而那条信息完全看不出根因是「入库的生成产物该重新生成了」。
+for f in rpc_builder.h rpc_reader.h rpc_verifier.h \
+         flatbuffers_common_builder.h flatbuffers_common_reader.h; do
   if [ -f "$VENDOR/uvrpc-generated/$f" ]; then
     echo "    ok  $f"
   else

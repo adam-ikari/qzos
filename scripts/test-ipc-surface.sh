@@ -68,6 +68,22 @@ else
   ok "外部进程拿不到 sys.storage.statfs 的数据"
 fi
 
+# 客户端必须**看得见**这是一次失败。
+#
+# 旧版 uvrpc 的 client 恒填 status=UVRPC_OK，失败被塞进 result 的头 4 字节而线上
+# 没有标签可区分——于是任何客户端都把失败看成成功（实测 status=0 result=[]）。
+# 4ed752a 修了它（"a failed request must arrive as a failure, not as a
+# successful result"），所以这条现在可以钉住：status 必须非零。
+#
+# 钉它的价值：若将来 uvrpc 又把错误帧当结果发，这条会红。而那种退化**极难**
+# 在别处被发现——功能测试照样全绿，只是每个客户端都悄悄把失败当成功。
+priv_status=$(sed -n 's/^status=\(-\?[0-9]*\).*/\1/p' "$TMP/priv.out" | head -1)
+if [ -n "$priv_status" ] && [ "$priv_status" -ne 0 ] 2>/dev/null; then
+  ok "客户端看到的是明确的失败（status=$priv_status），不是「成功 + 空结果」"
+else
+  bad "客户端把这次拒绝看成成功（status=${priv_status:-?}）——错误帧退化成了结果帧"
+fi
+
 # ---- 2. 正对照：公开方法必须真的能调通 ----
 # 没有这一条，上面那些「Handler not found」也可能只是客户端坏了。
 "$CLIENT" "$SOCK" sys.info >"$TMP/pub.out" 2>&1 || true
@@ -76,6 +92,12 @@ if grep -q '"service":"sys"' "$TMP/pub.out"; then
 else
   bad "正对照失败：sys.info 也调不通，所以上面的拒绝可能只是客户端坏了"
   sed 's/^/        /' "$TMP/pub.out" >&2
+fi
+pub_status=$(sed -n 's/^status=\(-\?[0-9]*\).*/\1/p' "$TMP/pub.out" | head -1)
+if [ "${pub_status:-x}" = "0" ]; then
+  ok "正对照的 status 是 0（与上面那条非零对照，证明 status 真的在区分）"
+else
+  bad "公开方法的 status=${pub_status:-?} 不是 0 —— 上面那条「非零」就没有对照意义"
 fi
 if grep -q "Handler not found: 'sys.info'" "$LOG"; then
   bad "sys.info 竟找不到 handler——IPC 公开面是空的"

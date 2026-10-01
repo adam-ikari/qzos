@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [uvrpc rpc services ipc libuv]
 created: "2026-09-30T00:24:44"
-updated: "2026-09-30T02:56:43"
+updated: "2026-10-01T07:05:21"
 ---
 
 <!-- compiled_truth -->
@@ -83,3 +83,9 @@ updated: "2026-09-30T02:56:43"
   summary: Rewrote compiled_truth to the new best understanding
   source: brain update-truth
   affects: [qzos-services-rpc]
+
+- time: 2026-10-01T07:05:21
+  kind: evidence
+  summary: "uvrpc ac450c5 → 4ed752a（20 个提交）升级完成，全量闸门 rc=0、原生与 MIPS 都过。其中一条直接**推翻了本仓记过的第三方限制**：`4b42b7d fix: a failed request must arrive as a failure, not as a successful result` —— 旧版 client 恒填 status=UVRPC_OK，失败被塞进 result 头 4 字节而线上无标签可区分，于是任何 uvrpc 客户端都把失败看成成功。现在外部客户端调被扣下的方法回的是 status=-12，scripts/test-ipc-surface.sh 把这条钉住（含正对照：sys.info 的 status 必须是 0），因为这种退化极难在别处被发现：功能测试照样全绿，只是每个客户端悄悄把失败当成功。另三条值得记：7a74a1a 忽略 SIGPIPE（客户端挂断不该杀死服务端）、536091a 在 reader 信任之前先验 FlatBuffers 帧（安全）、6a97a36 回收响应永不到达的 callback 槽位（正是「promise 永不 settle」那一类泄漏）"
+  source: "brain append-timeline：升级 + 全量闸门 + 新增 2 条 status 断言"
+  affects: [qzos-services-rpc, qzos-service-boundary]

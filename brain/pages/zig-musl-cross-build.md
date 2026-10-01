@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [toolchain, build]
 created: "2026-09-29T00:51:31"
-updated: "2026-10-01T05:45:18"
+updated: "2026-10-01T07:05:21"
 ---
 
 <!-- compiled_truth -->
@@ -59,3 +59,9 @@ updated: "2026-10-01T05:45:18"
   summary: "**qzjs 的嵌套子模块补丁由 qzjs/CMakeLists.txt 自己在配置阶段打**（quickjs-ng-c99-atomics / quickjs-ng-drain-jobs / libuv-c99-atomics，带「已应用则跳过」的幂等分支），所以仓内 scripts/ 与 tools/ 里搜不到任何 git apply 属正常。曾据此误判为「fresh clone 不可复现」——把 libuv 与 quickjs-ng 两个嵌套子模块 checkout 回干净上游再构建，CMake 重新打上补丁，工作树与还原前逐行相同（101/331 行），全量闸门 rc=0。另有 5 个补丁文件未被构建引用（quickjs-ng-bc-reader-hardening / quickjs-ng-debugger），内容已含在现用补丁里或已被取代。推论：**判断可复现性问题要在正确的层找补丁应用点**，本仓的补丁层在子模块自己的 CMake 里，不在本仓脚本里；「本仓搜不到 patch」不等于「没人打 patch」"
   source: brain append-timeline
   affects: [zig-musl-cross-build, port-verification]
+
+- time: 2026-10-01T07:05:21
+  kind: note
+  summary: "升级 uvrpc 暴露了一条**断掉的路**：`scripts/prepare-thirdparty.sh` 在产物缺失时提示「regenerate with scripts/gen-uvrpc-schema.sh」，而**那个脚本根本不存在**。也就是说「uvrpc 升级后生成头过期怎么办」这条路是断的——而它正是每次升级 uvrpc 都会撞上的第一件事。已补上：git submodule update --init deps/flatcc → 用 flatcc 自己的 CMake 编 flatcc_cli（手写 cc 命令会因漏掉 external/hash/*.c 而链接失败，且源文件列表会随版本烂掉）→ flatcc -c -v -w 生成 → 5 个头逐一检查。三个坑记下来：① 目标名是 flatcc_cli，flatcc 那个是静态库 libflatcc.a；② 产物落在**源码树**的 bin/ 下而不是 build 目录，找错位置时 cp 报 cannot stat，看起来像编译失败；③ -v 那个开关就是生成 rpc_verifier.h 的，少写它就少一个头，而缺头的报错（rpc_verifier.h: No such file or directory）完全看不出根因是「入库的生成产物过期了」"
+  source: brain append-timeline
+  affects: [zig-musl-cross-build, qzos-services-rpc]
