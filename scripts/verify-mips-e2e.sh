@@ -14,6 +14,13 @@ BD=${BD:-build-os-mips}
 [ -x "$BD/qzos-host" ] || { echo "missing $BD/qzos-host — run scripts/build-os.sh --mips" >&2; exit 1; }
 [ -x "$QEMU" ] || { echo "missing $QEMU — run scripts/fetch-tools.sh" >&2; exit 1; }
 
+. "$(dirname "$0")/check-mips-binary.sh"
+if ! hz_require_mips_binary; then
+  echo "MIPS binary is stale or missing — the assertions below would run against" >&2
+  echo "a previous build and report a false PASS. Refusing to run." >&2
+  exit 1
+fi
+
 OUT=$(mktemp -d)
 trap 'hz_stop; rm -rf "$OUT"' EXIT
 

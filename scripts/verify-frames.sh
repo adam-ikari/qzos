@@ -11,6 +11,13 @@
 # 用法:
 #   scripts/verify-frames.sh                 # 自动构建缺失的产物
 #   KEEP=1 scripts/verify-frames.sh          # 保留导出的帧到 /tmp/qzos-frames/
+. "$(dirname "$0")/check-mips-binary.sh"
+if ! hz_require_mips_binary; then
+  echo "MIPS binary is stale or missing — the assertions below would run against" >&2
+  echo "a previous build and report a false PASS. Refusing to run." >&2
+  exit 1
+fi
+
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

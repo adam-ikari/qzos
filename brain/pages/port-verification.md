@@ -5,7 +5,7 @@ category: project
 status: active
 tags: [verification, device, perf]
 created: "2026-09-29T00:51:32"
-updated: "2026-10-01T06:30:20"
+updated: "2026-10-01T07:45:01"
 ---
 
 <!-- compiled_truth -->
@@ -171,3 +171,9 @@ updated: "2026-10-01T06:30:20"
   summary: "把宿主进程改成「等判据出现就停」时踩了三个坑，都是**闸门自己的**问题而不是产品问题：① **哨兵必须可证明是最后一条**——拿「应用打的第一条结果」当哨兵，而回执投递顺序不保证，于是第二条先到、宿主被提前停掉、第三条回执永远丢失（这次是我自己引入的竞态）；改成让探针用 Promise.all 在全部 settle 后自己打完成标记。② **「按键后期望画面变化」不能用「按键数 +1」**——实测 down,down,enter 是 3 次提交（桌面 / 焦点移动 / 应用绘制），按 +1 等会在焦点移动那帧就停机、抓到桌面帧，症状是「标记区墨量 0」而看起来像产品坏了；改用「等提交次数稳定」（hz_wait_stable）。③ **回放按键必须用 hz_start 建的那个 FIFO**——调用方自己另建一个并把路径喂给 replay-keys，按键就写进了没人读的管道，宿主收不到输入，闸门报的是「no post-key commit」，指向完全错误的方向。另外「按键后期望**没有**变化」的用例（nav_stay/slowboot 断言的恰恰是「什么都没发生」）不能用稳定判据，只能给固定沉降——这类用例的沉降是语义的一部分，不是可以优化掉的浪费"
   source: brain append-timeline
   affects: [port-verification, qzos-ui-architecture]
+
+- time: 2026-10-01T07:45:01
+  kind: note
+  summary: "**MIPS 闸门曾在过期二进制上跑出 10/10 全绿。** qzjs 升级那次，MIPS 构建其实失败了（polyfill 要用目标架构 qjsc，x86 宿主 Exec format error，build-os-mips/qzos-host 还停在 15:04），而 verify-mips-e2e 拿旧二进制照跑，全绿。这类绿比红危险：它让人以为 MIPS 那侧验过了。已修：build-os.sh 在**构建成功后**写 build-<dir>/.build-stamp（记 qzjs/lvgl/uvrpc 三个 SHA，不是时间戳——时间戳只能证明「比某文件新」，真正要答的是「这二进制是从哪份依赖构建出来的」），scripts/check-mips-binary.sh 供闸门调用，verify-mips-e2e 与 verify-frames 在开头就检查，不匹配就**拒绝运行**而不是打警告。**没有戳本身就说明那次构建没成功过**。另注：polyfill 的重新生成由 polyfill/node_modules/esbuild 存在与否决定，而这个开关**在 85d056a9 上也一样会触发**——所以「装了 polyfill 工具链就必然交叉构建失败」是既有地雷，不是新版本引入的"
+  source: brain append-timeline
+  affects: [port-verification, zig-musl-cross-build]

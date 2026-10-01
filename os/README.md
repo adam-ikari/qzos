@@ -315,7 +315,7 @@ bash scripts/verify-all.sh
 | `os/test/verify-rt-recovery.sh` | JS 引擎崩溃恢复：杀 `qzjs-rt`，断言屏上出现提示、rt 被重建、桌面逐字节复现、开机失败也留在退避循环 | 是 / 否 |
 | `scripts/verify-input.sh` | 键盘端到端（`QZ_INPUT0` 接 FIFO 回放）+ e-ink 刷新预算 | 是 / 否 |
 | `scripts/verify-frames.sh` | 原生 vs MIPS 帧逐字节一致（MIPS 经 qemu-user） | 是 / 否 |
-| `scripts/verify-mips-e2e.sh` | MIPS 端到端：桌面/键盘/应用发现/授权遮蔽在 qemu-user 下逐条验 | 是 / 否 |
+| `scripts/verify-mips-e2e.sh` | MIPS 端到端：桌面/键盘/应用发现/授权遮蔽/`sys.power.*` 在 qemu-user 下逐条验（10 断言）。**开头先验二进制新鲜度**，过期就拒绝运行 | 是 / 否 |
 | `tools/rpc-ipc-selftest.sh` | 手工探测：外部 IPC 客户端调 `sys.info`。**闸门是上面的 `test-ipc-surface.sh`** | 是 / 否 |
 
 前三项是毫秒级的纯逻辑单测——上层现象不对时先确认它们是绿的，否则容易在上层猜错方向。
@@ -348,6 +348,19 @@ CPU 侧本来就不贵：空闲 9s 的 host 只用 0.02s CPU（0% 占用）。�
 
 反过来，「按键后期望**没有**变化」的用例（`nav_stay` / `slowboot`，它们断言的
 恰恰是「什么都没发生」）不能用稳定判据，只能给固定沉降。
+
+**MIPS 闸门会先验二进制新鲜度。** `verify-mips-e2e.sh` 与 `verify-frames.sh` 开头调用
+`scripts/check-mips-binary.sh`：比对 `build-os-mips/.build-stamp` 里记的 qzjs/lvgl/uvrpc
+三个 SHA 与当前子模块 HEAD，不一致就**拒绝运行**。
+
+起因是实测踩到的一次假绿：qzjs 升级那次 MIPS 构建其实失败了（polyfill 的字节码要用
+**目标架构的** qjsc 生成，x86 宿主上 `Exec format error`，二进制停在 15:04），而闸门拿
+旧二进制跑出 **10/10 全绿**。那种绿比红危险 —— 它让人以为 MIPS 那侧验过了，而闸门测的
+是二进制、不是依赖一致性，所以「子模块变了、二进制没跟上」这个状态它天然看不见。
+
+戳记的是 **SHA 而不是时间戳**：时间戳只能证明「比某个文件新」，而真正要回答的问题是
+「这个二进制是从哪份依赖构建出来的」。戳由 `build-os.sh` 在**构建成功之后**写入，
+所以「没有戳」本身就说明那次构建没成功过。
 
 **跑闸门要看退出码，不要只看断言行。** 曾经 `verify-frames.sh` 里
 `frame-preview.sh | head -3` 让 preview 收到 SIGPIPE 返回 141，`set -euo pipefail`
