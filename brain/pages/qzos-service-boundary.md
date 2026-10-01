@@ -5,7 +5,7 @@ category: decision
 status: active
 tags: [architecture services authorization boundary]
 created: "2026-09-30T14:54:52"
-updated: "2026-10-01T05:45:18"
+updated: "2026-10-01T06:41:56"
 ---
 
 <!-- compiled_truth -->
@@ -113,3 +113,14 @@ QuickJS 全局**，`ui` 是全局对象，所以「谁能声明授权」这个�
   summary: Rewrote compiled_truth to the new best understanding
   source: brain update-truth
   affects: [qzos-service-boundary]
+
+- time: 2026-10-01T06:41:41
+  kind: note
+  source: "brain append-timeline：单测 74→78 断言 + 2 个变异"
+  affects: [qzos-service-boundary, qzos-app-package]
+
+- time: 2026-10-01T06:41:56
+  kind: note
+  summary: "能力表 5 项、服务面已覆盖 3 项：info（唯一 cap=NULL 的方法，公开只读元信息，谁都能调）、storage（sys.storage.statfs）、power（sys.power.state / sys.power.request）；**settings 与 net 至今没有任何方法**——应用可以声明、manifest 校验会过、授权会给出非空 perms，然后调不到任何东西。这不是漏洞（没有方法=不可达）但是一张 expectation 的口子：作者看到能力表里有 net，会以为有某种方式能用它。所以把「哪些能力还没实现」写成 os/test/test_services.c 里的显式清单而不是靠记忆——加了能力忘了实现方法那条断言会红，反过来实现了方法忘了加能力则由注册表的命名空间自洽检查兜住。net 属 M9 配网，且要先在真机上查清厂商栈（c1-wifi-stack）。写清单时踩到一个必须记下的特例：info 是唯一 cap=NULL 的方法，按「method_cap 等于能力名」匹配会漏掉它，第一版断言因此报「info 既没有方法也没进清单」，而 sys.info 明明就在那儿——这类特例要写在代码里，否则下一个人会以为表错了"
+  source: "brain append-timeline：单测 74→78 断言 + 2 个变异"
+  affects: [qzos-service-boundary, qzos-app-package]
