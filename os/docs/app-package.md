@@ -19,10 +19,21 @@ qzos 要作为**系统**替换设备上原有的程序（brain `qzos-as-system`�
    要求哪一版宿主 UI 桥」。宿主给某个 op 改了语义，旧应用会静默出错，而不是
    被拒绝启动。
 
-2. **没有任何授权。** `os/src/bridge.c` 的 `op_rpc` 拿到任意 `method` 字符串直接
-   转发给 `qzos_services_rpc`，宿主不看、不问「谁在调」。今天唯一的 builtin 服务
-   是只读的 `sys.info`，所以看不出问题；等 `sys.power.shutdown` 落地，**任何应用
-   都能关机**。这是「把厂商守护进程的能力收进服务面」这件事必须先补的地基。
+2. ~~**没有任何授权。**~~ **已修（2026-09-30 ~ 10-01）。**
+   原文：`op_rpc` 拿到任意 `method` 字符串直接转发，宿主不看、不问「谁在调」，
+   「等 `sys.power.shutdown` 落地，**任何应用都能关机**」。
+
+   修的过程分两步，缺一不可 —— **判定的位置**和**判定的输入可不可信**是两个
+   正交的轴：
+
+   - 判定从渲染桥搬到**服务面**（`services.c` 的注册表 + 能力闸门）。挂在
+     `op_rpc` 上只挡住了那一条通道，而 JS 还能走别的路碰到 C。
+   - 能力来源从**消息**换成**磁盘**（`appauth.c` 读 `<QZ_JS_DIR>/apps/<id>/app.json`）。
+     只做前一步的话，`perms` 数组仍然由应用自己填 —— 实测 `perms: []` 的应用
+     调一次 `ui.setApp('self', ['storage'])` 就把 `sys.storage.statfs` 调通了。
+
+   详细形状见下面「授权有三个执行点」一节；闸门是 `scripts/test-appauth.sh`
+   与 `scripts/test-ipc-surface.sh`。
 
 3. **只能单文件。** `shell.js` 的 `launch()` 用 `new Function(src)` 把入口源码当
    字符串求值，应用没法 `require` 同目录的兄弟文件。记事本这类应用一旦超过
@@ -98,49 +109,82 @@ qzos 要作为**系统**替换设备上原有的程序（brain `qzos-as-system`�
 
 `perms` 里是**能力**，不是方法名。能力 `X` 授予 `sys.X` 与 `sys.X.*` 全部方法。
 
-| 能力 | 覆盖方法 | v1 |
+| 能力 | 覆盖方法 | 状态 |
 | --- | --- | --- |
-| `info` | `sys.info` | 可用（只读） |
-| `storage` | `sys.storage*` | 规划中（只读） |
-| `settings` | `sys.settings*` | 规划中（只读） |
-| `net` | `sys.net*` | 等闸门 0（brain `c1-wifi-stack`） |
-| `power` | `sys.power*` | 等闸门 0——**关机绝不能默认授予** |
+| `info` | `sys.info` | 可用（只读）。**唯一 `cap=NULL` 的方法**——公开只读元信息，谁都能调 |
+| `storage` | `sys.storage.statfs` | 可用（只读）。**注意：没有读/写文件的方法**，应用拿不到任何持久化 |
+| `settings` | — | **未实现**。声明了没有方法：能声明、能拿到非空 perms，然后调不到东西 |
+| `net` | — | **未实现**，等闸门 0（brain `c1-wifi-stack` 要先在真机上查清厂商栈） |
+| `power` | `sys.power.state` / `sys.power.request` | 可用。**关机绝不能默认授予**；归属未确认时全拒 |
 
-两条硬规则：
+「未实现」这件事写在 `os/test/test_services.c` 的显式清单里，不是靠记忆：加了
+能力忘了实现方法，那条断言会红。目的是让能力表和实际可达的方法集不漂移。
+
+三条硬规则：
 
 - **不在 `sys.` 命名空间下的方法，应用永远调不到。** 那是宿主自用/IPC 外部
   服务的面。一个应用要能调 `sys.storage`，只需要能力 `storage`。
+- **注册表是穷举的，不是前缀匹配。** 见下面「授权有三个执行点」一节。
 - **default-deny。** 没声明就是没有。
 
 ### 宿主怎么知道「当前是哪个应用」
 
-C 侧的 `op_rpc` 要能逐次比对，就必须知道当前应用——那是 shell 的事，所以需要
-一条新 op：
+shell 在 launch 前发一条 op，back 时清空：
 
 ```json
-{"op":"app","id":"notepad","perms":["storage"]}   // shell 在 launch 前发
-{"op":"app","id":null,"perms":[]}                 // back 时清空
+{"op":"app","id":"notepad"}     ← 只有 id
+{"op":"app","id":null}          ← back 时清空
 ```
 
-宿主把它存成「当前应用上下文」，`op_rpc` 逐次比对。**缺省上下文为空**，
-即没发过 `op:app` 的调用一律按无授权处理。shell 与宿主对同一份 perms 各持一份：
-C 用它守方法名，JS 用它装面——所以 manifest 解析与校验只应有一处实现。
+> ⚠️ **这条消息里没有 `perms`，而且即使带上也不会被读。**
+>
+> 早期设计是 `{"op":"app","id":"notepad","perms":["storage"]}`，宿主照单收下当
+> 授权用。那是**完整的提权漏洞**：应用与 shell 共享同一个 QuickJS 全局、`ui` 是
+> 全局对象，于是任何应用都能自己调 `ui.setApp('self', ['storage'])` 给自己授权。
+> 实测（`perms: []` 的应用）：
+>
+> ```
+> DECLARED=[]                      ← manifest 只声明零能力
+> SETAPP ACCEPTED
+> qzos-services: app 'escaper' authorized (1 caps)
+> sys.storage.statfs *** ALLOWED ***
+> ```
+>
+> 不需要外部进程、不需要 socket。**JS 可以点名一个应用，不能决定它能做什么。**
 
-### 强制点：`op_rpc` 的检查在 C，遮蔽在 JS
+所以授权的**唯一**合法来源是磁盘：`<QZ_JS_DIR>/apps/<id>/app.json`，由
+`os/src/appauth.c` 解析。`perms` 字段被忽略，且**会记账**——声称与推导不一致时
+启动日志里打出 `claimed N cap(s), host derived M`，否则「为什么我的能力没生效」
+会完全不可见。
 
-授权有**两个**执行点，缺一不可：
+**缺省上下文为空**（`id: null`），即没发过 `op:app` 的调用一律按无授权处理。
 
-| 层 | 位置 | 挡什么 |
-| --- | --- | --- |
-| C | `bridge.c` 的 `op_rpc` | 越权方法名（`sys.power` / `sys.*` 命名空间） |
-| JS | launch 前装面（上一节） | 文件系统、`processSpawn`、TCP 等原生面 |
+manifest 解析因此有**两份**实现，方向相反：`os/js/apkg.js` 那份用于**发现与展示**
+（决定要不要把应用列出来、UI 上显不显示按钮），`os/src/appauth.c` 那份用于
+**强制**。JS 那份被改坏时最多让界面显示出错的按钮；C 那份被改坏才是安全问题。
+同步靠闸门（`scripts/test-services.sh` + `scripts/test-appauth.sh`），不靠约定。
 
-为什么 `op_rpc` 那层**不能**只放 JS：shell 与应用共享同一个 QuickJS 上下文，
-应用可以改写 shell 自己的 `ui.rpc`，所以放在 JS 的方法名检查能被应用自己撤销。
-而遮蔽面（fs/native）**必须**放 JS——那些是 JS 的全局对象，C 侧没有对应的
-过滤点（`__native__` 是一次性挂上的一整个对象，没有逐方法的宿主钩子）。
+### 授权有三个执行点，加一个独立的信任轴
 
-分工因此是：**C 守方法名边界，JS 守全局对象面。** 两者都要有。
+| 层 | 位置 | 挡什么 | 能不能被应用撤销 |
+| --- | --- | --- | --- |
+| C | `services.c` 的服务注册表 + 能力闸门 | 越权方法名、不在注册表内的方法 | **不能**（方法在 C 的表里，不是消息带来的） |
+| C | `appauth.c` 从磁盘 manifest 推导能力 | 「自己给自己授权」 | **不能**（输入是磁盘，不是消息） |
+| JS | launch 前装面（上一节） | 文件系统、`processSpawn`、TCP 等原生面 | 不能（面在应用代码加载前就装好） |
+
+**判定的位置**和**判定的输入可不可信**是两个正交的轴，缺一不可：
+
+- 判定挂在渲染桥的 `op_rpc` 上时，只挡住了那一条通道——挂错位置的检查等于
+  没有检查。判定必须落在服务面（JS 碰 C 的唯一通道）。
+- 判定在服务面、但输入仍由 JS 提供时，等于没判——`perms` 数组是应用自己填的。
+  输入必须来自磁盘。
+
+为什么三层**不能**只放 JS：shell 与应用共享同一个 QuickJS 上下文，应用可以改写
+shell 自己的 `ui.rpc`，所以放在 JS 的方法名检查能被应用自己撤销。而遮蔽面
+（fs/native）**必须**放 JS——那些是 JS 的全局对象，C 侧没有对应的过滤点
+（`__native__` 是一次性挂上的一整个对象，没有逐方法的宿主钩子）。
+
+分工因此是：**C 守方法名边界与能力来源，JS 守全局对象面。** 两者都要有。
 
 ### 这条边界不是隔离：JS 注入能挡误用，挡不住蓄意攻击
 
@@ -255,12 +299,28 @@ current = { dir: app.dir, perms: app.perms };
 
 - **default-deny 真的生效**：应用声明 `perms: []` 调 `sys.info` 必须拿到拒绝，
   而不是「RPC 回了东西」。断言要落在**结果**上。
-- **能力前缀规则**：给 `storage` 之后 `sys.storage` 通、而 `sys.settings` 仍被拒。
-  只测前者会漏掉「前缀写错就全放开」。
+- **能力来源是磁盘不是消息**：一个 `perms: []` 的应用调
+  `ui.setApp('self', ['storage'])` 之后调 `sys.storage.statfs`，必须**失败**。
+  这条挡的就是那个提权漏洞。只测「manifest 声明的能力生效」完全测不到它——
+  实测里声明 `["storage"]` 的应用和声明 `[]` 然后自己加权的应用，perms
+  数组长得一模一样。**必须配正对照**：磁盘上声明了 `["storage"]` 的应用，
+  即使自己声明零能力，仍然放行——否则「全都拒了」也能让两条都绿。
+  闸门：`scripts/test-appauth.sh`。
+- **注册表是穷举的，不是前缀匹配**：`sys.storage`（未实现）必须得到
+  `no such service`，而不是「有权限就能调」。前缀式匹配曾让 `sys.` 下的
+  任何方法名都可达，而实际 handler 只有一个——那是给未来留了一扇没锁的门。
 - **未知能力 = 拒绝启动**，不是静默忽略。
-- **目录可写 → perms 被清空**：在 world-writable 目录里放一个声明
+- **用户目录的应用一律零能力**：在 world-writable 目录里放一个声明
   `perms:["info"]` 的应用，断言它调 `sys.info` **失败**。这条挡的是
   「信任检查写了但没接线」——和 c1pkg 踩的「mock 那半边形同虚设」同一类。
+  注意机制不是「逐级 stat 检查目录可写性」，而是**受信根只有
+  `<QZ_JS_DIR>/apps`**，用户目录根本不在查找范围内。后者更简单也更难绕过：
+  前者要判断一整条路径链，后者只需要一个根。
+- **外部 IPC 碰不到需能力的方法**：`tools/qzos-rpc-client` 连
+  `ipc://$QZ_RPC_SOCK` 调 `sys.storage.statfs`，宿主日志里必须出现
+  `Handler not found`。unix socket 上没有可用的调用方身份（设备是单用户 root
+  盒，uid 区分不出谁是谁），所以那里**补不了授权**，只能划清暴露面。
+  闸门：`scripts/test-ipc-surface.sh`。
 - **路径逃逸**：`entry: "../other/app.js"` 与 `api.require('../../etc/passwd')`
   都被拒。
 - **`id` 与目录名不符** → 拒绝启动。
